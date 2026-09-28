@@ -6,9 +6,15 @@ full range of univariate and multivariate methods used for **simultaneous
 determination of compounds in mixtures**, validate methods, and keep a
 **complete, tamper‑evident log of every operation** performed on every spectrum.
 
-> Status: **Draft — awaiting review.** Items marked **[DECIDE]** need your input.
-> Items marked **[REC]** are my recommendations; tick or strike them in the
-> review checklist at the end.
+> Status: **Approved with changes (review round 1).**
+> Decisions from review:
+> - **No user roles / login / e‑signatures.** The audit trail still records the
+>   operating‑system user and workstation for every entry.
+> - **Instrument‑agnostic import.** No parser is tied to a specific vendor or
+>   model: a generic text/CSV parser (any delimiter, decimal comma, header
+>   lines, column/row/XY‑pair layouts), Excel (.xlsx/.xlsm/.xls), and the
+>   open exchange formats JCAMP‑DX and Galactic SPC that most instrument
+>   software can export.
 
 ---
 
@@ -132,9 +138,9 @@ docs/
 ### 5.1 Import / export
 - CSV/TXT (λ, A columns; multi‑column), Excel.
 - **JCAMP‑DX** (.jdx/.dx), **Thermo Galactic SPC** (.spc).
-- Vendor exports: Shimadzu UVProbe (.txt/.spc export), Agilent Cary WinUV
-  (.csv), PerkinElmer (.sp/.asc), Jasco (.txt/.jws export) — **[DECIDE]** which
-  instruments your lab actually uses; I'll prioritise those parsers.
+- **Any instrument model**: parsers are layout‑driven, not vendor‑driven.
+  Auto‑detects delimiter, decimal separator, header/metadata lines, and
+  layout (λ + N columns, XY column pairs, or spectra in rows).
 - Batch import with filename → metadata mapping rules (e.g.
   `PAR_10_CAF_5_rep2.csv` → PAR 10 µg/mL, CAF 5 µg/mL, replicate 2).
 - Resampling/interpolation to a common λ grid, with a check for mismatched
@@ -257,17 +263,10 @@ Rules:
 
 ---
 
-## 7. Users, security, e‑signatures **[REC]**
+## 7. Users & security — *removed from scope (review round 1)*
 
-- Local user accounts with roles: **Analyst**, **Reviewer**, **Admin**.
-- Password hashing (Argon2), lockout after N failures, auto‑logout on idle.
-- Trial workflow: Draft → Submitted → Reviewed → Approved (locked).
-- Electronic signature = re‑enter password + meaning ("Performed by",
-  "Reviewed by", "Approved by"), stored in the audit trail and printed on
-  reports.
-- Optional Windows/AD login integration later.
-
----
+No roles, login or e‑signatures. Every audit entry records the OS user name
+and workstation automatically.
 
 ## 8. Quality & verification of the software
 
@@ -293,7 +292,6 @@ Rules:
 | M3 | Univariate methods | Zero‑order + derivative + ratio‑spectra family (§5.4–5.6), zero‑crossing / isoabsorptive detection | Reference datasets recovered within ±2 % |
 | M4 | Validation & reports | ICH Q2 module, statistics, PDF/Excel reports | Report for a full binary‑mixture trial |
 | M5 | Chemometrics | CLS, PCR, PLS, MCR‑ALS, CV, calibration design, variable selection | Matches scikit‑learn / published results |
-| M6 | Users & e‑signatures | Roles, login, workflow states, signatures | Approved trial is locked; edits require reason |
 | M7 | Packaging | Windows installer, user manual, sample project | Installs on a clean Windows 10/11 PC |
 
 Suggested order puts the audit trail **first** (M0) — retro‑fitting it later
@@ -346,7 +344,7 @@ Please tick what you accept, strike what you reject, and add comments.
 - [ ] Append‑only, hash‑chained audit trail with integrity check
 - [ ] Mandatory reason‑for‑change after a trial leaves Draft
 - [ ] No hard deletes (archive/void only)
-- [ ] User roles, login, e‑signatures, review/approval workflow
+- [x] ~~User roles, login, e‑signatures~~ (removed)
 - [ ] Audit trail included in PDF reports
 
 **Scientific scope**
