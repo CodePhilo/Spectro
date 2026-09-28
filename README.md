@@ -1,0 +1,80 @@
+# Spectro
+
+A Windows desktop application for organizing UV/Vis spectral trials in a
+pharmaceutical analytical chemistry lab. It supports every mainstream
+spectrophotometric method for **simultaneous determination of compounds in
+mixtures**, and it **logs every operation** in a tamper-evident audit trail.
+
+- **Instrument-independent import.** Text/CSV from any spectrophotometer (any
+  delimiter, decimal comma, header lines; column, XY-pair or row layouts),
+  Excel (`.xlsx`, `.xls`), JCAMP-DX, GRAMS SPC, and OLE-container `.spc`
+  (e.g. Shimadzu UVProbe).
+- **Non-destructive processing.** Raw data can never be changed. Each
+  processing result is stored as a new *derived* spectrum that records its
+  parent and its exact pipeline, so it can be recomputed and verified at any
+  time.
+- **Audit trail.** Every import, edit, processing step, calculation, export
+  and archive is logged with the user, workstation, UTC time, parameters,
+  before/after values, reason for change and data hashes. Entries are
+  hash-chained and the database rejects edits or deletions, so any tampering
+  is detected by *Audit → Verify data integrity*.
+
+See [`docs/PLAN.md`](docs/PLAN.md) for the full plan and the review checklist.
+
+## Install and run (from source)
+
+```bash
+python -m pip install -r requirements.txt
+python run_spectro.py            # or: python -m spectro
+```
+
+Python 3.10+ is required. To build a standalone Windows program
+(`dist\Spectro\Spectro.exe`), run `build_windows.bat`. The GitHub Actions
+workflow `.github/workflows/windows.yml` runs the tests, builds the `.exe`
+and uploads it as the `Spectro-windows` artifact on every push.
+
+## Typical workflow
+
+1. **File → New project…** creates one `.spectro` file (a SQLite database) that
+   holds everything.
+2. **Edit → Compounds…** adds the analytes (e.g. PAR, CAF) and their units.
+3. **File → Import spectra…** adds files. Check the preview, type or paste
+   concentrations (or *Fill concentrations from names*), then choose the trial
+   and role (`standard`, `calibration`, `mixture`, `sample`, `blank`,
+   `divisor`…).
+4. **Process → Processing pipeline…** chains smoothing, baseline correction,
+   derivatives, ratio spectra, subtraction and so on, with a live preview.
+5. **Methods** calibrates and determines concentrations. Results show
+   % recovery, mean, SD and RSD, and can be saved.
+6. **Tools → Validation statistics** covers linearity, LOD/LOQ, accuracy,
+   precision/ANOVA, t/F tests, the interval hypothesis test and standard
+   addition.
+7. **File → Trial report** exports a PDF or HTML report with spectra,
+   lineage, methods, results and the audit trail.
+
+## Methods
+
+| Family | Methods |
+|---|---|
+| Pre-processing | crop, resample, Savitzky–Golay, moving average, Whittaker; baseline offset, two-point, iterative polynomial, ALS; blank subtraction and spectral arithmetic; normalisation (max, area, vector, at λ, range), SNV, %T ↔ A |
+| Zero order | direct λmax; Vierordt simultaneous equations and multi-wavelength least squares; absorbance ratio (Q-analysis); dual wavelength; induced dual wavelength; absorbance subtraction; amplitude modulation; area under curve (single and equations); bivariate (with Kaiser λ selection); H-point standard addition |
+| Derivative | D1–D4 (finite difference Δλ or Savitzky–Golay, scaling factor); zero-crossing; peak-to-peak; dual wavelength in derivative mode; factorized zero-order |
+| Ratio spectra | derivative ratio (DD1); ratio difference; mean centering of ratio spectra; successive derivative ratio and double divisor (ternary); ratio subtraction and extended ratio subtraction; constant multiplication; constant center; spectrum subtraction; plateau/constant value |
+| Chemometrics | CLS, ILS/MLR, PCR, PLS-1, PLS-2, MCR-ALS (non-negativity + correlation constraint), ANN (MLP on PCA scores), SVR; LOO / venetian / k-fold / contiguous cross-validation with Haaland–Thomas selection of components; iPLS and GA interval selection; VIP; Hotelling T² vs Q outliers; Brereton 5-level multifactor calibration design |
+| Finder tools | zero-crossing points, isoabsorptive points, maxima/minima, ratio-spectrum plateaus |
+| Validation (ICH Q2(R2)) | regression with SD and 95 % CI of slope and intercept, LOD/LOQ (σ of intercept or Sy/x), lack-of-fit, recovery, %RSD, one-way ANOVA, Student's t, F-test, interval hypothesis, standard addition, RMSEP/bias/SEP |
+| Greenness | AGREE (weighted 12 principles with pictogram), Analytical Eco-Scale, GAPI |
+
+Each method is tested in `tests/test_methods.py` against synthetic binary and
+ternary mixtures with known concentrations.
+
+## Development
+
+```bash
+python -m pip install -r requirements.txt pytest
+QT_QPA_PLATFORM=offscreen python -m pytest -q
+```
+
+Layout: `spectro/core` (algorithms and file formats, no UI),
+`spectro/storage` (project database and audit trail), `spectro/ui` (PySide6
+windows and dialogs), `tests/`.

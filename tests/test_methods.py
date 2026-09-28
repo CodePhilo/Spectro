@@ -10,7 +10,7 @@ from spectro.core.multicomponent import (SignalEquations, SpectralModel, brereto
 from spectro.core.operations import REGISTRY, apply_pipeline, describe_step
 from spectro.core.spectrum import Spectrum
 from spectro.core.validation import linear_regression
-from tests.conftest import GRID, PURE, mixture
+from tests.conftest import GRID, mixture
 
 TOL = 0.02  # 2 % relative error
 

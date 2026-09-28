@@ -6,7 +6,7 @@ full range of univariate and multivariate methods used for **simultaneous
 determination of compounds in mixtures**, validate methods, and keep a
 **complete, tamper‑evident log of every operation** performed on every spectrum.
 
-> Status: **Approved with changes (review round 1).**
+> Status: **v0.1 implemented** (see §13). **Approved with changes (review round 1).**
 > Decisions from review:
 > - **No user roles / login / e‑signatures.** The audit trail still records the
 >   operating‑system user and workstation for every entry.
@@ -15,6 +15,10 @@ determination of compounds in mixtures**, validate methods, and keep a
 >   lines, column/row/XY‑pair layouts), Excel (.xlsx/.xlsm/.xls), and the
 >   open exchange formats JCAMP‑DX and Galactic SPC that most instrument
 >   software can export.
+> - **All method families in v1**, including ANN and greenness metrics
+>   (AGREE, Eco‑Scale, GAPI).
+> - **Formal validation documents (GMP/CSV: URS, traceability matrix, test
+>   report) are deferred** to a later update.
 
 ---
 
@@ -201,7 +205,7 @@ docs/
 - **CLS** (classical least squares), **ILS/MLR**.
 - **PCR**, **PLS‑1 / PLS‑2**.
 - **MCR‑ALS** (with non‑negativity, closure, unimodality constraints).
-- **ANN** (MLP regression) — optional **[DECIDE]**.
+- **ANN** (MLP regression) — included (review round 1). Also **SVR**.
 - Variable selection: interval PLS (iPLS), GA‑PLS, VIP / selectivity ratio.
 - Cross‑validation (LOO, k‑fold, venetian blinds), RMSECV / RMSEP, choice of
   latent variables with plots.
@@ -221,8 +225,7 @@ docs/
 - Application to dosage forms: % label claim.
 - Comparison with reference/official method: Student's t, F‑test, one‑way
   ANOVA, and interval hypothesis tests.
-- (Optional) greenness scores (Eco‑Scale, GAPI, AGREE) commonly required by
-  journals **[DECIDE]**.
+- Greenness scores (Eco‑Scale, GAPI, AGREE) — included (review round 1).
 
 ### 5.9 Reporting
 - Trial report (PDF): metadata, spectra figures, pipeline steps, calibration
@@ -277,8 +280,8 @@ and workstation automatically.
 - Golden‑file tests for importers (sample files from each instrument).
 - Test that every UI command produces exactly one audit entry.
 - Deliverables for lab CSV (computer system validation): requirements
-  spec (URS), traceability matrix, test report — **[DECIDE]** whether you
-  need these formally (GAMP 5 Category 4/5).
+  spec (URS), traceability matrix, test report — **deferred to a later
+  update** (review round 1).
 
 ---
 
@@ -310,20 +313,21 @@ is the most common failure in lab software.
 
 ---
 
-## 11. Open questions **[DECIDE]**
+## 11. Open questions (answers from review round 1 in italics)
 
 1. Which spectrophotometer(s) and software (Shimadzu UV‑1800/UVProbe, Agilent
    Cary, PerkinElmer Lambda, Jasco V‑series…)? Can you share a few sample
-   export files?
+   export files? — *No restriction: import must work with any model, plus
+   Excel/CSV.* (Real sample exports are still welcome for regression tests.)
 2. Single PC, or several PCs sharing projects (network folder vs. a small
    server DB such as PostgreSQL)?
 3. Is the app used in a **GMP/QC** setting (needs Part 11 controls and CSV
-   documentation) or **R&D/academic** (lighter controls acceptable)?
-4. Which methods are highest priority? (e.g. your current trials are
-   binary/ternary, which methods do you publish most?)
-5. Is ANN / advanced chemometrics needed in v1, or can it wait for v2?
+   documentation) or **R&D/academic** (lighter controls acceptable)? — *Maybe
+   in later updates.*
+4. Which methods are highest priority? — *All methods of the field.*
+5. Is ANN / advanced chemometrics needed in v1, or can it wait for v2? — *v1.*
 6. Report language/branding (lab logo, SOP numbers, template)?
-7. Greenness assessment tools (AGREE/GAPI/Eco‑Scale) — needed?
+7. Greenness assessment tools (AGREE/GAPI/Eco‑Scale) — needed? — *Yes (v1).*
 8. Is Python + PySide6 acceptable, or is there an IT requirement for .NET?
 
 ---
@@ -368,3 +372,27 @@ Please tick what you accept, strike what you reject, and add comments.
 - [ ] Deployment (single PC / shared)
 - [ ] GMP vs R&D setting
 - [ ] Method priority list
+
+---
+
+## 13. Implementation status (v0.1)
+
+| Milestone | Status | Notes |
+|---|---|---|
+| M0 Foundation | ✅ | SQLite project file; append‑only, hash‑chained audit (DB triggers block UPDATE/DELETE); every mutating call logs in the same transaction; integrity check of the chain and every spectrum's data hash |
+| M1 Import & view | ✅ | Layout‑driven text/CSV parser (delimiter, decimal comma, headers, columns / XY pairs / rows, UTF‑16), Excel .xlsx/.xls, JCAMP‑DX (incl. ASDF compression), GRAMS SPC (new and old formats), OLE .spc (e.g. Shimadzu); project tree, overlay plot with crosshair, properties, metadata, lineage, per‑spectrum history |
+| M2 Pre‑processing & pipelines | ✅ | 27 registered operations with auto‑generated forms, live preview, derived spectra with lineage, "recompute from raw" verification |
+| M3 Univariate methods | ✅ | Generic pipeline + measurement + calibration (19 templates), equation methods (Vierordt, multi‑λ LS, bivariate + Kaiser, AUC), Q‑analysis, absorbance subtraction, amplitude modulation, HPSAM, finder tools |
+| M4 Validation & reports | ✅ | ICH Q2 statistics; PDF/HTML trial report with audit trail |
+| M5 Chemometrics | ✅ | CLS, ILS, PCR, PLS1/2, MCR‑ALS, ANN, SVR, CV, iPLS, GA, VIP, T²/Q, Brereton design |
+| M7 Packaging | ✅ (CI) | PyInstaller build verified on Linux; Windows `.exe` built by GitHub Actions |
+| Formal CSV documentation | ⏳ | Deferred per review |
+
+Suggested next steps (for review):
+- [ ] Try the app on real exports from your instruments and send any file that
+      imports incorrectly (it becomes a regression test).
+- [ ] Check the method templates against your SOPs (Δλ, scaling factor,
+      divisor concentration conventions).
+- [ ] Decide whether a reason for change should be *mandatory* for every edit
+      (it is currently mandatory for archiving and optional elsewhere).
+- [ ] Code signing of the Windows installer (needs a certificate).
