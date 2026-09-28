@@ -66,7 +66,8 @@ class FinderDialog(Base):
         for text, fn in (("Zero-crossing points of A", self._zero),
                          ("Isoabsorptive points of A and B", self._iso),
                          ("Maxima and minima of A", self._extrema),
-                         ("Plateau regions of A (ratio spectra)", self._plateau)):
+                         ("Plateau regions of A (ratio spectra)", self._plateau),
+                         ("λ where A equals its value at 'From' (λ pairs)", self._equal)):
             b = QPushButton(text)
             b.clicked.connect(fn)
             f.addRow(b)
@@ -125,6 +126,17 @@ class FinderDialog(Base):
         rows = [["max", w, v] for w, v in e["maxima"]] + [["min", w, v] for w, v in e["minima"]]
         rows.sort(key=lambda r: r[1])
         self._report("extrema", ["Type", "λ (nm)", "Value"], rows, [r[1] for r in rows])
+
+    def _equal(self):
+        a, _ = self._spectra()
+        ref = self.lo.value()
+        try:
+            pts = uv.equal_amplitude_wavelengths(a, ref)
+        except ValueError as exc:
+            error(self, exc)
+            return
+        self._report(f"equal amplitude to {ref:g} nm", ["λ (nm)", f"Value (= value at {ref:g} nm)"],
+                     [[p, a.value_at(p)] for p in pts], [ref] + pts)
 
     def _plateau(self):
         a, _ = self._spectra()

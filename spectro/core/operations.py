@@ -258,6 +258,17 @@ def op_divide(s, reference: Spectrum, threshold: float = 1e-4):
     return out
 
 
+@register("divide_sum", "Divide by sum of two spectra (double divisor)", "Ratio spectra",
+          [_ref("reference", "Divisor 1 (e.g. pure Y)"), _ref("reference2", "Divisor 2 (e.g. pure Z)"),
+           Param("factor2", "Multiply divisor 2 by", "float", 1.0),
+           Param("threshold", "Ignore divisor below", "float", 1e-4, minimum=0.0)])
+def op_divide_sum(s, reference: Spectrum, reference2: Spectrum, factor2: float = 1.0,
+                  threshold: float = 1e-4):
+    """Double divisor ratio spectrum: mixture ÷ (Y′ + k·Z′)."""
+    div = s.with_values(_on_grid(reference, s) + factor2 * _on_grid(reference2, s))
+    return op_divide(s, div, threshold)
+
+
 @register("multiply", "Multiply by spectrum", "Arithmetic", [_ref()])
 def op_multiply(s, reference: Spectrum):
     """A × B (e.g. restore a ratio spectrum to absorbance)."""
@@ -392,6 +403,21 @@ def op_constant_multiplication(s, divisor: Spectrum, start: float, end: float):
     ratio = op_divide(s, divisor)
     plateau = _region_mean(s.with_values(ratio), start, end)
     return plateau * _on_grid(divisor, s)
+
+
+@register("extended_ratio_subtraction", "Extended ratio subtraction (recover Y)",
+          "Spectrum resolution",
+          [_ref("divisor", "Divisor Y′ (pure extended component)"),
+           _ref("reference", "Pure X spectrum X′"),
+           _wl("start", "Plateau from (nm)", 300.0), _wl("end", "to (nm)", 320.0)])
+def op_extended_ratio_subtraction(s, divisor: Spectrum, reference: Spectrum, start: float,
+                                  end: float):
+    """Ratio subtraction recovers X; the recovered X is matched to the pure X′
+    spectrum (least-squares factor k) and Y = mixture − k·X′."""
+    x_rec = op_ratio_subtraction(s, divisor, start, end)
+    xp = _on_grid(reference, s)
+    k = float(np.dot(x_rec, xp) / np.dot(xp, xp))
+    return s.values - k * xp
 
 
 def _transform(s: Spectrum, derivative_order: int, delta_lambda: float) -> Spectrum:

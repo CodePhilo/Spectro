@@ -7,9 +7,10 @@ from typing import Any, Callable
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QGuiApplication, QKeySequence
+from PySide6.QtCore import QEventLoop, QThread, Qt, Signal
+from PySide6.QtGui import QAction, QGuiApplication, QKeySequence
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox,
+                               QFileDialog, QProgressDialog,
                                QFormLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
                                QListWidget, QListWidgetItem, QMessageBox, QPushButton,
                                QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
@@ -29,6 +30,17 @@ TEXT_SECONDARY = "#52514e"
 GRID_ALPHA = 0.12
 
 pg.setConfigOptions(antialias=True, background=SURFACE, foreground=TEXT_SECONDARY)
+
+# Set by the main window: EXPORT_HOOK(summary, details) records exports in the
+# open project's audit trail.
+EXPORT_HOOK: Callable[[str, dict], None] | None = None
+
+VIEW_MODES = ("Overlay", "Stacked", "Difference", "Normalized")
+
+
+def log_export(summary: str, details: dict) -> None:
+    if EXPORT_HOOK is not None:
+        EXPORT_HOOK(summary, details)
 
 
 def colours_for(n: int) -> list[str]:
@@ -364,18 +376,23 @@ class MeasurementEditor(QWidget):
 # Spectrum plot
 # --------------------------------------------------------------------------- #
 class SpectrumPlot(pg.PlotWidget):
-    """Overlay plot with crosshair readout and hover identification."""
+    """Spectrum plot (overlay / stacked / difference / normalized views) with
+    crosshair readout, hover identification and publication-figure export."""
 
     hovered = Signal(str)
     line_moved = Signal(str, float)
 
     def __init__(self, parent: QWidget | None = None, y_label: str = "Absorbance"):
         super().__init__(parent)
+        self.base_label = y_label
         self.setLabel("bottom", "Wavelength (nm)")
         self.setLabel("left", y_label)
         self.showGrid(x=True, y=True, alpha=GRID_ALPHA)
         self.legend = self.addLegend(offset=(-10, 10), labelTextColor=TEXT_SECONDARY)
         self.curves: list[tuple[pg.PlotDataItem, Spectrum]] = []
+        self.raw: list[Spectrum] = []
+        self.view_mode = "Overlay"
+        self.offset = 0.0  # 0 = automatic (stacked view)
         self.vlines: dict[str, pg.InfiniteLine] = {}
         pen = pg.mkPen("#8a8984", width=1, style=Qt.DashLine)
         self._vx = pg.InfiniteLine(angle=90, pen=pen)
@@ -385,13 +402,57 @@ class SpectrumPlot(pg.PlotWidget):
             self.addItem(ln, ignoreBounds=True)
         self._proxy = pg.SignalProxy(self.scene().sigMouseMoved, rateLimit=30,
                                      slot=self._mouse)
+        from spectro.ui.figure import install_figure_export
+        install_figure_export(self)
+
+    def set_view(self, mode: str, offset: float | None = None) -> None:
+        self.view_mode = mode
+        if offset is not None:
+            self.offset = offset
+        self._render(keep_range=False)
+
+    def auto_offset(self) -> float:
+        spans = [float(np.ptp(s.values)) for s in self.raw]
+        return 0.5 * float(np.median(spans)) if spans else 0.0
+
+    def transformed(self) -> tuple[list[Spectrum], str]:
+        """Spectra as displayed in the current view, and the y-axis label."""
+        mode, raw = self.view_mode, self.raw
+        if mode == "Stacked" and raw:
+            off = self.offset or self.auto_offset()
+            return ([s.with_values(s.values + i * off) for i, s in enumerate(raw)],
+                    f"{self.base_label} (offset {off:.3g} per spectrum)")
+        if mode == "Difference" and raw:
+            ref = raw[0]
+            out = []
+            for s in raw:
+                lo, hi = max(s.x[0], ref.x[0]), min(s.x[-1], ref.x[-1])
+                m = (s.x >= lo) & (s.x <= hi)
+                if m.sum() < 2:
+                    continue
+                d = s.values[m] - np.interp(s.x[m], ref.x, ref.y)
+                out.append(s.copy(wavelengths=s.x[m], values=d, name=f"{s.name} − ref"))
+            return out, f"Δ {self.base_label.lower()} (minus {ref.name})"
+        if mode == "Normalized" and raw:
+            out = []
+            for s in raw:
+                m = float(np.max(np.abs(s.values))) or 1.0
+                out.append(s.with_values(s.values / m))
+            return out, f"{self.base_label} (normalized to max = 1)"
+        return list(raw), self.base_label
 
     def plot_spectra(self, spectra: list[Spectrum], keep_range: bool = False) -> None:
+        self.raw = list(spectra)
+        self._render(keep_range)
+
+    def _render(self, keep_range: bool) -> None:
         vr = self.viewRange() if keep_range else None
         for item, _ in self.curves:
             self.removeItem(item)
         self.legend.clear()
         self.curves = []
+        spectra, label = self.transformed()
+        self.setLabel("left", label)
         cols = colours_for(len(spectra))
         show_legend = len(spectra) <= 12
         for s, c in zip(spectra, cols):
@@ -455,11 +516,58 @@ class SpectrumPlot(pg.PlotWidget):
 # Table with copy/paste (Excel-compatible)
 # --------------------------------------------------------------------------- #
 class PasteTable(QTableWidget):
+    """Table with Excel-compatible copy/paste and export (right-click menu)."""
+
     def __init__(self, rows: int = 0, cols: int = 0, parent: QWidget | None = None):
         super().__init__(rows, cols, parent)
+        self.export_title = "Table"
+        self.export_notes: list[str] = []
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.horizontalHeader().setStretchLastSection(True)
+        self.setContextMenuPolicy(Qt.ActionsContextMenu)
+        for text, fn in (("Copy", self.copy_selection), ("Copy whole table", self.copy_all),
+                         ("Export table to Excel…", self.export_excel)):
+            a = QAction(text, self)
+            a.triggered.connect(fn)
+            self.addAction(a)
+
+    def table_data(self) -> tuple[list[str], list[list[Any]]]:
+        headers = [self.horizontalHeaderItem(j).text() if self.horizontalHeaderItem(j) else ""
+                   for j in range(self.columnCount())]
+        rows = []
+        for i in range(self.rowCount()):
+            row = []
+            for j in range(self.columnCount()):
+                it = self.item(i, j)
+                val = it.data(Qt.UserRole) if it is not None else None
+                if val is None:
+                    t = it.text() if it is not None else ""
+                    try:
+                        val = float(t.replace(",", ".")) if t.strip() else None
+                    except ValueError:
+                        val = t
+                row.append(val)
+            rows.append(row)
+        return headers, rows
+
+    def export_excel(self) -> None:
+        from spectro.storage.tables import export_table_excel
+
+        path, _ = QFileDialog.getSaveFileName(self, "Export table", f"{self.export_title}.xlsx",
+                                              "Excel (*.xlsx)")
+        if not path:
+            return
+        if not path.lower().endswith(".xlsx"):
+            path += ".xlsx"
+        headers, rows = self.table_data()
+        try:
+            export_table_excel(path, headers, rows, self.export_title, self.export_notes)
+        except Exception as exc:
+            error(self, exc)
+            return
+        log_export(f"Exported table '{self.export_title}' to Excel",
+                   {"file": path, "rows": len(rows)})
 
     def keyPressEvent(self, e) -> None:
         if e.matches(QKeySequence.Copy):
@@ -530,6 +638,8 @@ def fill_table(table: QTableWidget, headers: list[str], rows: list[list[Any]],
             it = QTableWidgetItem(fmt(v) if not isinstance(v, str) else v)
             if isinstance(v, (int, float)) and not isinstance(v, bool):
                 it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                if not editable:  # full precision for export (edited cells use text)
+                    it.setData(Qt.UserRole, float(v))
             if not editable:
                 it.setFlags(it.flags() & ~Qt.ItemIsEditable)
             table.setItem(i, j, it)
@@ -562,3 +672,89 @@ class SpectrumChecklist(QListWidget):
     def set_all(self, state: bool) -> None:
         for i in range(self.count()):
             self.item(i).setCheckState(Qt.Checked if state else Qt.Unchecked)
+
+
+# --------------------------------------------------------------------------- #
+# Background work with a progress dialog
+# --------------------------------------------------------------------------- #
+class _Worker(QThread):
+    progressed = Signal(int, int)
+
+    def __init__(self, fn, kwargs):
+        super().__init__()
+        self.fn, self.kwargs = fn, kwargs
+        self.result, self.exc = None, None
+        self.cancel = False
+
+    def _progress(self, done: int, total: int) -> bool:
+        self.progressed.emit(int(done), int(total))
+        return not self.cancel
+
+    def run(self) -> None:
+        try:
+            self.result = self.fn(progress=self._progress, **self.kwargs)
+        except BaseException as exc:  # re-raised in the GUI thread
+            self.exc = exc
+
+
+def run_with_progress(parent: QWidget, label: str, fn, **kwargs):
+    """Run ``fn(progress=callback, **kwargs)`` in a worker thread while a
+    cancellable progress dialog is shown. ``fn`` must not touch the database
+    or widgets (pass pre-loaded spectra and a snapshot resolver).
+
+    Raises InterruptedError if the user cancels."""
+    dlg = QProgressDialog(label, "Cancel", 0, 0, parent)
+    dlg.setWindowTitle("Working…")
+    dlg.setWindowModality(Qt.WindowModal)
+    dlg.setMinimumDuration(300)
+    w = _Worker(fn, kwargs)
+
+    def on_progress(done, total):
+        dlg.setMaximum(total)
+        dlg.setValue(done)
+
+    w.progressed.connect(on_progress)
+    dlg.canceled.connect(lambda: setattr(w, "cancel", True))
+    loop = QEventLoop()
+    w.finished.connect(loop.quit)
+    w.start()
+    loop.exec()
+    dlg.close()
+    if w.exc is not None:
+        raise w.exc
+    return w.result
+
+
+def snapshot_resolver(project, *containers) -> Callable[[Any], Spectrum]:
+    """Resolver backed by pre-loaded spectra (safe to use from a worker thread).
+
+    ``containers`` are pipelines / measurements / dicts; every spectrum id
+    referenced in them is loaded now."""
+    from spectro.core.operations import REGISTRY
+
+    ids: set[int] = set()
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            op = REGISTRY.get(obj.get("op", ""))
+            params = obj.get("params", {})
+            if op is not None:
+                for p in op.params:
+                    if p.kind == "spectrum" and params.get(p.name) is not None:
+                        ids.add(int(params[p.name]))
+            elif isinstance(params, dict) and params.get("reference") is not None:
+                ids.add(int(params["reference"]))
+            for v in obj.values():
+                if isinstance(v, (list, dict)):
+                    walk(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                walk(v)
+
+    for c in containers:
+        walk(c)
+    cache = {i: project.spectrum(i) for i in ids}
+
+    def resolve(ref):
+        return cache[int(ref)]
+    return resolve

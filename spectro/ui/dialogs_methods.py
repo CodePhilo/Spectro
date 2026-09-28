@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox,
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
+                               QFormLayout,
+                               QGroupBox,
                                QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
                                QListWidgetItem, QPlainTextEdit, QPushButton, QScrollArea,
                                QSpinBox, QSplitter, QTableWidget, QTabWidget, QVBoxLayout,
@@ -41,6 +44,8 @@ def xy_plot(x_label: str, y_label: str) -> pg.PlotWidget:
     p.setLabel("left", y_label)
     p.showGrid(x=True, y=True, alpha=0.12)
     p.addLegend(offset=(10, 10), labelTextColor=TEXT_SECONDARY)
+    from spectro.ui.figure import install_figure_export
+    install_figure_export(p)
     return p
 
 
@@ -64,11 +69,14 @@ def checklists(project, compound: str | None = None, cal_roles=CAL_ROLES, test_r
                trial: int | None = None):
     recs = project.records(trial_id=trial)
     cal, test = SpectrumChecklist(), SpectrumChecklist()
-    cal_ids = {r.id for r in recs if r.role in cal_roles and
+    # defaults use raw spectra only: methods apply their own processing, and
+    # derived spectra inherit the role and concentrations of their parent
+    raw = [r for r in recs if r.kind == "raw"]
+    cal_ids = {r.id for r in raw if r.role in cal_roles and
                (compound is None or r.concentrations.get(compound, 0) > 0)}
-    if cal_roles is TRAIN_ROLES and any(r.role == "calibration" for r in recs):
-        cal_ids = {r.id for r in recs if r.role == "calibration"}
-    test_ids = {r.id for r in recs if r.role in test_roles}
+    if cal_roles is TRAIN_ROLES and any(r.role == "calibration" for r in raw):
+        cal_ids = {r.id for r in raw if r.role == "calibration"}
+    test_ids = {r.id for r in raw if r.role in test_roles}
     cal.populate(recs, cal_ids)
     test.populate(recs, test_ids)
     return cal, test
@@ -159,6 +167,19 @@ class UnivariateDialog(Base):
             b.clicked.connect(fn)
             btns.addWidget(b)
         ll.addLayout(btns)
+        btns = QHBoxLayout()
+        for t, fn, tip in (
+                ("Standard addition…", self._std_addition,
+                 "Spectra to determine = unspiked sample(s) + spiked samples; the compound "
+                 "concentration of each spectrum is the amount ADDED (0 = unspiked)."),
+                ("Robustness…", self._robustness,
+                 "Vary method parameters (λ, Δλ, plateau, window…) by ± a small amount and "
+                 "compare the results")):
+            b = QPushButton(t)
+            b.setToolTip(tip)
+            b.clicked.connect(fn)
+            btns.addWidget(b)
+        ll.addLayout(btns)
         root.addWidget(scroll(left))
         self.tabs = QTabWidget()
         self.plot = SpectrumPlot(y_label="Processed signal")
@@ -191,7 +212,8 @@ class UnivariateDialog(Base):
 
     def _reselect(self, comp):
         recs = self.project.records()
-        ids = {r.id for r in recs if r.role in CAL_ROLES and r.concentrations.get(comp, 0) > 0}
+        ids = {r.id for r in recs if r.kind == "raw" and r.role in CAL_ROLES
+               and r.concentrations.get(comp, 0) > 0}
         self.cal.populate(recs, ids)
         self._preview()
 
@@ -290,6 +312,10 @@ class UnivariateDialog(Base):
         self.summary.setText(summary_text(recs))
         self.predictions = {"ids": ids, "names": names, "found": found, "taken": taken,
                             "signals": signals, "recovery": recs}
+        self.last = (self.method.name, "univariate",
+                     {"method": self.method.to_dict(), "compounds": [comp],
+                      "found": [[f] for f in found], **{k: v for k, v in self.predictions.items()
+                                                         if k != "found"}}, ids)
         self.tabs.setCurrentIndex(2)
         self.project.log("CALCULATE", f"Determined {comp} in {len(ids)} spectra with "
                                       f"'{self.method.name}'",
@@ -305,13 +331,162 @@ class UnivariateDialog(Base):
         self.win.statusBar().showMessage("Method saved.")
 
     def _save_results(self):
-        if not self.predictions:
-            error(self, "Determine first.")
+        if not getattr(self, "last", None):
+            error(self, "Determine, run standard addition or a robustness study first.")
             return
-        self.project.save_result(f"{self.method.name}", "univariate", {
-            "method": self.method.to_dict(), **self.predictions},
-            self.win.current_trial(), getattr(self, "method_id", None), self.predictions["ids"])
+        name, kind, data, ids = self.last
+        self.project.save_result(name, kind, data, self.win.current_trial(),
+                                 getattr(self, "method_id", None), ids)
         self.win.statusBar().showMessage("Results saved.")
+
+    def _ready_method(self) -> bool:
+        if self.method is None:
+            self._calibrate()
+        return self.method is not None
+
+    def _std_addition(self):
+        if not self._ready_method():
+            return
+        ids = self.test.checked_ids()
+        comp = self.method.compound
+        spectra = self.project.spectra(ids)
+        added = [s.concentrations.get(comp, 0.0) for s in spectra]
+        if len(ids) < 2 or not any(added) or all(added):
+            error(self, "Check the unspiked sample(s) (concentration of "
+                        f"{comp} = 0 or blank) and the spiked samples (concentration of {comp} "
+                        "= amount added).")
+            return
+        res = self.project.resolver()
+        try:
+            sa = uv.standard_addition_recovery(lambda s: self.method.predict(s, res),
+                                               spectra, added)
+        except Exception as exc:
+            error(self, exc)
+            return
+        rows = [[r["name"], r["added"], r["found"],
+                 "" if r["recovered"] is None else r["recovered"],
+                 "" if r["recovery"] is None else r["recovery"]] for r in sa["rows"]]
+        fill_table(self.results, ["Spectrum", f"{comp} added", "Found (total)",
+                                  "Recovered (found − sample)", "Recovery %"], rows)
+        self.results.export_title = f"Standard addition {comp}"
+        lines = [f"{comp} in the sample (mean of unspiked): {sa['sample']:.4f}",
+                 f"Recovery of added {comp}: mean {sa['mean_recovery']:.2f} %"
+                 + (f", SD {sa['sd_recovery']:.3f}" if sa["sd_recovery"] == sa["sd_recovery"]
+                    else "")]
+        if "extrapolated" in sa:
+            lines.append(f"Extrapolated (x-intercept of found vs added): {sa['extrapolated']:.4f}")
+        self.summary.setText("\n".join(lines))
+        self.results.export_notes = lines
+        self.tabs.setCurrentIndex(2)
+        self.last = (f"{self.method.name} — standard addition", "standard_addition",
+                     {"method": self.method.to_dict(), "ids": ids, **sa}, ids)
+        self.project.log("CALCULATE", f"Standard addition for {comp} with '{self.method.name}'",
+                         {"inputs": ids, "result": sa})
+
+    def _robustness(self):
+        if not self._ready_method():
+            return
+        test_ids = self.test.checked_ids()
+        if not test_ids:
+            error(self, "Check the spectra to determine (e.g. lab mixtures) first.")
+            return
+        dlg = RobustnessDialog(self, self.method, self.project.spectra(self.cal_ids),
+                               self.project.spectra(test_ids))
+        if dlg.exec() and dlg.result_data:
+            self.last = (f"{self.method.name} — robustness", "robustness",
+                         {"method": self.method.to_dict(), "ids": test_ids,
+                          **dlg.result_data}, test_ids)
+            self.project.log("CALCULATE", f"Robustness study of '{self.method.name}'",
+                             {"inputs": self.cal_ids + test_ids,
+                              "rsd_across_variants": dlg.result_data["rsd_across_variants"],
+                              "max_abs_deviation": dlg.result_data["max_abs_deviation"]})
+
+
+class RobustnessDialog(QDialog):
+    """Choose parameters and ± deltas; run the study in a worker thread."""
+
+    def __init__(self, parent, method: uv.UnivariateMethod, cal, test):
+        super().__init__(parent)
+        self.setWindowTitle(f"Robustness — {method.name}")
+        self.resize(1000, 640)
+        self.method, self.cal, self.test = method, cal, test
+        self.project = parent.project
+        self.result_data = None
+        self.params = uv.numeric_parameters(method)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("Each checked parameter is moved to nominal − Δ and nominal + Δ; "
+                             "the method is re-calibrated and the spectra are re-assayed. "
+                             "Small deviations (e.g. < 2 %) indicate a robust method."))
+        lay.itemAt(0).widget().setWordWrap(True)
+        self.table = PasteTable()
+        fill_table(self.table, ["Use", "Parameter", "Nominal", "Δ (±)"],
+                   [["", p["label"], p["value"], f"{p['delta']:g}"] for p in self.params],
+                   editable=True)
+        for i, p in enumerate(self.params):
+            it = self.table.item(i, 0)
+            it.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+            it.setCheckState(Qt.Checked if p["kind"] == "wavelength" else Qt.Unchecked)
+            for j in (1, 2):
+                self.table.item(i, j).setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+        self.table.setMaximumHeight(220)
+        lay.addWidget(self.table)
+        run = QPushButton("Run robustness study")
+        run.clicked.connect(self._run)
+        lay.addWidget(run)
+        self.out = PasteTable()
+        self.out.export_title = "Robustness"
+        lay.addWidget(self.out, 1)
+        self.summary = QLabel()
+        self.summary.setWordWrap(True)
+        lay.addWidget(self.summary)
+        from PySide6.QtWidgets import QDialogButtonBox
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.button(QDialogButtonBox.Ok).setText("Keep result")
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+    def _run(self):
+        from spectro.ui.widgets import run_with_progress, snapshot_resolver
+
+        variations = []
+        try:
+            for i, p in enumerate(self.params):
+                if self.table.item(i, 0).checkState() == Qt.Checked:
+                    d = float(self.table.item(i, 3).text().replace(",", "."))
+                    variations.append({**p, "delta": d})
+        except ValueError as exc:
+            error(self, f"Invalid Δ: {exc}")
+            return
+        if not variations:
+            error(self, "Check at least one parameter.")
+            return
+        resolve = snapshot_resolver(self.project, self.method.steps, self.method.measurement)
+        try:
+            res = run_with_progress(self, "Running robustness study…", uv.robustness_study,
+                                    method=uv.UnivariateMethod.from_dict(self.method.to_dict()),
+                                    calibration=self.cal, test=self.test,
+                                    variations=variations, resolve=resolve)
+        except InterruptedError:
+            return
+        except Exception as exc:
+            error(self, exc)
+            return
+        rows = []
+        for v in res["variants"]:
+            if "error" in v:
+                rows.append([v["label"], v["change"], "", "", "", "", "", v["error"]])
+            else:
+                rows.append([v["label"], v["change"], v["slope"], v["r"], v["mean_found"],
+                             v["mean_recovery"], v["rsd_recovery"], v["deviation"]])
+        fill_table(self.out, ["Parameter", "Change", "Slope", "r", "Mean found",
+                              "Mean recovery %", "RSD %", "Deviation from nominal %"], rows)
+        verdict = "robust" if res["max_abs_deviation"] < 2 else "sensitive — review"
+        self.summary.setText(f"RSD of results across variants: {res['rsd_across_variants']:.3f} % · "
+                             f"largest deviation from nominal: {res['max_abs_deviation']:.3f} % "
+                             f"→ {verdict}")
+        self.out.export_notes = [self.summary.text()]
+        self.result_data = res
 
 
 # --------------------------------------------------------------------------- #
@@ -533,6 +708,8 @@ class SpecialDialog(Base):
         tabs.addTab(self._q_tab(), "Absorbance ratio (Q-analysis)")
         tabs.addTab(self._as_tab(), "Absorbance subtraction")
         tabs.addTab(self._am_tab(), "Amplitude modulation")
+        tabs.addTab(self._iam_tab(), "Induced amplitude modulation")
+        tabs.addTab(self._aas_tab(), "Advanced absorbance subtraction")
         tabs.addTab(self._h_tab(), "H-point standard addition")
         lay = QVBoxLayout(self)
         lay.addWidget(tabs, 1)
@@ -689,6 +866,81 @@ class SpecialDialog(Base):
                    {"iso": m.iso, "plateau": m.plateau, "divisor": self.am_div.currentData()},
                    f"Total calibration at iso: r = {m.total_regression.r:.5f}")
 
+    def _iam_tab(self):
+        self.iam_x, self.iam_y = self._combo(0), self._combo(1)
+        self.iam_w = wl_spin(250)
+        self.iam_p1, self.iam_p2 = wl_spin(330), wl_spin(350)
+        self.iam_xs, self.iam_ys, self.iam_mix = self._lists(1, 2, 3)
+        run = QPushButton("Calculate")
+        run.clicked.connect(self._run_iam)
+        info = QLabel("Mixture ÷ unit-concentration Y′ (averaged from the Y standards).\n"
+                      "Plateau (Y only) → C_Y; P(λ) − C_Y divided by the factor\n"
+                      "aX/aY at λ (from X standards) → C_X. No isoabsorptive point needed.")
+        return self._layout([("X", self.iam_x), ("Y (extended)", self.iam_y),
+                             ("λ for X", self.iam_w), ("Plateau from", self.iam_p1),
+                             ("Plateau to", self.iam_p2), (info, QLabel("")), ("", run)],
+                            [("X standards", self.iam_xs), ("Y standards (divisor)", self.iam_ys),
+                             ("Mixtures", self.iam_mix)])
+
+    def _run_iam(self):
+        x, y = self.iam_x.currentText(), self.iam_y.currentText()
+        try:
+            div = uv.InducedAmplitudeModulation.unit_divisor(
+                self.project.spectra(self.iam_ys.checked_ids()), y)
+            m = uv.InducedAmplitudeModulation(self.iam_w.value(),
+                                              (self.iam_p1.value(), self.iam_p2.value()))
+            m.fit(self.project.spectra(self.iam_xs.checked_ids()), x, div)
+            out = [(s, m.predict(s, div)) for s in self.project.spectra(self.iam_mix.checked_ids())]
+        except Exception as exc:
+            error(self, exc)
+            return
+        self._show("Induced amplitude modulation", x, y, out,
+                   {"wavelength": m.wavelength, "plateau": m.plateau, "factor": m.factor},
+                   f"Factor aX/aY at {m.wavelength:g} nm = {m.factor:.5g}")
+
+    def _aas_tab(self):
+        self.aas_x, self.aas_y = self._combo(0), self._combo(1)
+        self.aas_w1, self.aas_w2 = wl_spin(260), wl_spin(245)
+        self.aas_xs, self.aas_ys, self.aas_mix = self._lists(1, 2, 3)
+        find = QPushButton("Find λ1 where Y equals its value at λ2")
+        find.clicked.connect(self._aas_find)
+        run = QPushButton("Calculate")
+        run.clicked.connect(self._run_aas)
+        return self._layout([("X", self.aas_x), ("Y (interferent)", self.aas_y),
+                             ("λ2 (e.g. λmax of X)", self.aas_w2), ("λ1", self.aas_w1),
+                             ("", find), ("", run)],
+                            [("X standards", self.aas_xs), ("Y standards", self.aas_ys),
+                             ("Mixtures", self.aas_mix)])
+
+    def _aas_find(self):
+        ids = self.aas_ys.checked_ids()
+        if not ids:
+            error(self, "Check at least one Y standard.")
+            return
+        cands = uv.equal_amplitude_wavelengths(self.project.spectrum(ids[-1]), self.aas_w2.value())
+        if not cands:
+            error(self, "Y does not reach the same absorbance at any other wavelength.")
+            return
+        choice, ok = QInputDialog.getItem(self, "Equal absorbance of Y", "λ1:",
+                                          [f"{c:.2f}" for c in cands], 0, False)
+        if ok:
+            self.aas_w1.setValue(float(choice))
+
+    def _run_aas(self):
+        x, y = self.aas_x.currentText(), self.aas_y.currentText()
+        try:
+            m = uv.AdvancedAbsorbanceSubtraction(self.aas_w1.value(), self.aas_w2.value())
+            m.fit(self.project.spectra(self.aas_xs.checked_ids()), x,
+                  self.project.spectra(self.aas_ys.checked_ids()), y)
+            out = [(s, m.predict(s)) for s in self.project.spectra(self.aas_mix.checked_ids())]
+        except Exception as exc:
+            error(self, exc)
+            return
+        self._show("Advanced absorbance subtraction", x, y, out,
+                   {"w1": m.w1, "w2": m.w2, "AF": m.amplitude_factor},
+                   f"Amplitude factor = {m.amplitude_factor:.5g}; X (ΔA) r = "
+                   f"{m.x_regression.r:.5f}; Y at λ2 r = {m.y_regression.r:.5f}")
+
     def _h_tab(self):
         self.h_x = self._combo(0)
         self.h_w1, self.h_w2 = wl_spin(260), wl_spin(300)
@@ -837,8 +1089,25 @@ class ChemometricsDialog(Base):
         rl.addWidget(self.results)
         rl.addWidget(self.summary)
         self.tabs.addTab(rw, "Results")
+        ow = QWidget()
+        ol = QVBoxLayout(ow)
+        orow = QHBoxLayout()
+        self.conf = QComboBox()
+        self.conf.addItems(["95", "99"])
+        self.conf.currentTextChanged.connect(lambda _: self._show_diagnostics())
+        excl = QPushButton("Exclude flagged calibration spectra and refit")
+        excl.clicked.connect(self._exclude_outliers)
+        orow.addWidget(QLabel("Confidence limit (%)"))
+        orow.addWidget(self.conf)
+        orow.addStretch(1)
+        orow.addWidget(excl)
+        ol.addLayout(orow)
         self.diag_plot = xy_plot("Hotelling T²", "Q residuals")
-        self.tabs.addTab(self.diag_plot, "Outliers (T² vs Q)")
+        ol.addWidget(self.diag_plot, 2)
+        self.diag_table = PasteTable()
+        self.diag_table.export_title = "Outlier diagnostics"
+        ol.addWidget(self.diag_table, 1)
+        self.tabs.addTab(ow, "Outliers (T² / Q)")
         self.aux_plot = SpectrumPlot(y_label="Value")
         self.tabs.addTab(self.aux_plot, "Loadings / VIP / pure spectra")
         self.info = QPlainTextEdit()
@@ -880,14 +1149,23 @@ class ChemometricsDialog(Base):
             raise ValueError("check at least three calibration spectra")
         return ids, self.project.spectra(ids)
 
+    def _work(self, label, fn, **kwargs):
+        """Run fn in a worker thread with a cancellable progress dialog."""
+        from spectro.ui.widgets import run_with_progress
+        return run_with_progress(self, label, fn, **kwargs)
+
     def _cv(self):
+        from spectro.ui.widgets import snapshot_resolver
         try:
             m = self._build()
             ids, spectra = self._cal()
-            cv = m.cross_validate(spectra, self.project.resolver(), self.cv.currentText(),
-                                  self.folds.value(),
-                                  max_components=min(15, len(ids) - 2) if m.model_type in
-                                  ("PCR", "PLS1", "PLS2", "ANN") else None)
+            latent = m.model_type in ("PCR", "PLS1", "PLS2", "ANN")
+            cv = self._work(f"Cross-validating {m.model_type}…", m.cross_validate,
+                            spectra=spectra, resolve=snapshot_resolver(self.project, m.steps),
+                            method=self.cv.currentText(), folds=self.folds.value(),
+                            max_components=min(15, len(ids) - 2) if latent else None)
+        except InterruptedError:
+            return
         except Exception as exc:
             error(self, exc)
             return
@@ -910,22 +1188,36 @@ class ChemometricsDialog(Base):
                           "curve": cv["curve"], "suggested": cv["suggested_components"]})
 
     def _fit(self):
+        from spectro.ui.widgets import snapshot_resolver
         try:
             m = self._build()
             ids, spectra = self._cal()
-            m.fit(spectra, self.project.resolver())
             test_ids = self.test.checked_ids()
             test = self.project.spectra(test_ids)
-            pred = m.predict(test, self.project.resolver()) if test else np.zeros((0, len(m.compounds)))
-            diag = m.diagnostics(spectra, self.project.resolver())
+            resolve = snapshot_resolver(self.project, m.steps)
+
+            def job(progress):
+                progress(0, 3)
+                m.fit(spectra, resolve)
+                progress(1, 3)
+                pred = m.predict(test, resolve) if test else np.zeros((0, len(m.compounds)))
+                progress(2, 3)
+                d_cal = m.diagnostics(spectra, resolve)
+                d_test = m.diagnostics(test, resolve) if test else None
+                return pred, d_cal, d_test
+            pred, diag, diag_test = self._work(f"Fitting {m.model_type}…", job)
+        except InterruptedError:
+            return
         except Exception as exc:
             error(self, exc)
             return
         self.model, self.cal_ids = m, ids
+        self._diag = (spectra, test, diag, diag_test)
         # predicted vs actual
         self.pred_plot.clear()
         rows, lines = [], []
         lo, hi = np.inf, -np.inf
+        from spectro.core.validation import prediction_error
         for j, c in enumerate(m.compounds):
             pts = [(s.concentrations[c], p[j], s.name) for s, p in zip(test, pred)
                    if s.concentrations.get(c) is not None]
@@ -934,7 +1226,6 @@ class ChemometricsDialog(Base):
                 scatter(self.pred_plot, a, b, SERIES[j % 8], c, labels=list(n))
                 lo, hi = min(lo, *a, *b), max(hi, *a, *b)
                 recs = [100 * y / x for x, y, _ in pts if x]
-                from spectro.core.validation import prediction_error
                 pe = prediction_error(b, a)
                 lines.append(f"{c}: RMSEP {pe['RMSEP']:.4g}, R² {pe['R2']:.4f}. "
                              + summary_text(recs))
@@ -949,15 +1240,13 @@ class ChemometricsDialog(Base):
             rows.append(row)
         fill_table(self.results, ["Spectrum"] + [h for c in m.compounds for h in
                                                  (f"{c} found", f"{c} taken", f"{c} rec %")], rows)
+        self.results.export_title = f"{m.model_type} predictions"
         self.summary.setText("\n".join(lines))
-        # diagnostics
-        self.diag_plot.clear()
-        names = [s.name for s in spectra]
-        scatter(self.diag_plot, diag["T2"], diag["Q"], SERIES[0], "Calibration", labels=names)
+        self.results.export_notes = lines
+        self._show_diagnostics()
         # auxiliary spectra
         from spectro.core.spectrum import Spectrum
         grid = np.array(diag["grid"])
-        aux = []
         if m.model_type == "MCR-ALS":
             aux = [Spectrum(grid, row, name=f"MCR-ALS {c}") for c, row in
                    zip(m.compounds, m.state["S"])]
@@ -974,25 +1263,89 @@ class ChemometricsDialog(Base):
                 f"({grid[0]:g}–{grid[-1]:g} nm); preprocessing: {m.preprocessing}"]
         if m.model_type in ("PCR", "PLS1", "PLS2", "ANN"):
             info.append(f"Components: {m.n_components}")
+        info.append("RMSEC: " + ", ".join(f"{c} {v:.4g}" for c, v in
+                                          zip(m.compounds, m.state["rmsec"])))
         info.append("Explained variance (PCA of X): " + ", ".join(
             f"{100 * v:.2f}%" for v in diag["explained"][:6]))
+        lim = diag["limits"]
+        info.append(f"Limits: T² 95 % {lim['t2_lim95']:.3g}, 99 % {lim['t2_lim99']:.3g}; "
+                    f"Q 95 % {lim['q_lim95']:.3g}, 99 % {lim['q_lim99']:.3g}")
         if m.model_type == "MCR-ALS":
             info.append(f"MCR-ALS lack of fit: {m.state['lof']:.4f} %")
         self.info.setPlainText("\n".join(info))
         self.predictions = {"ids": test_ids, "compounds": m.compounds, "found": pred.tolist()}
-        self.tabs.setCurrentIndex(1 if rows else 5)
+        self.tabs.setCurrentIndex(1 if rows else 3)
         self.project.log("CALCULATE", f"Fitted {m.model_type} and predicted {len(test_ids)} spectra",
                          {"inputs": ids + test_ids, "model": m.to_dict(),
                           "found": pred.tolist()})
 
+    def _show_diagnostics(self):
+        if not getattr(self, "_diag", None):
+            return
+        spectra, test, _, _ = self._diag
+        a = self.conf.currentText()
+        from spectro.ui.widgets import snapshot_resolver
+        resolve = snapshot_resolver(self.project, self.model.steps)
+        diag = self.model.diagnostics(spectra, resolve, alpha=a)
+        diag_test = self.model.diagnostics(test, resolve, alpha=a) if test else None
+        self.diag_plot.clear()
+        scatter(self.diag_plot, diag["T2"], diag["Q"], SERIES[0], "Calibration",
+                labels=[s.name for s in spectra])
+        if diag_test:
+            scatter(self.diag_plot, diag_test["T2"], diag_test["Q"], SERIES[1], "Predicted",
+                    labels=[s.name for s in test])
+        lim = diag["limits"]
+        for tag, style in (("95", Qt.DashLine), ("99", Qt.DotLine)):
+            pen = pg.mkPen("#8a8984", width=1, style=style)
+            self.diag_plot.addItem(pg.InfiniteLine(lim[f"t2_lim{tag}"], angle=90, pen=pen,
+                                                   label=f"T² {tag}%",
+                                                   labelOpts={"position": 0.95}))
+            self.diag_plot.addItem(pg.InfiniteLine(lim[f"q_lim{tag}"], angle=0, pen=pen,
+                                                   label=f"Q {tag}%",
+                                                   labelOpts={"position": 0.95}))
+        rows = []
+        self._flagged = []
+        for group, sp, d in (("calibration", spectra, diag), ("predicted", test, diag_test)):
+            if not d:
+                continue
+            for s, t2, q, f in zip(sp, d["T2"], d["Q"], d["flags"]):
+                rows.append([s.name, group, t2, q, ", ".join(f) or "—"])
+                if f and group == "calibration":
+                    self._flagged.append(s.metadata.get("id"))
+        fill_table(self.diag_table, ["Spectrum", "Set", "Hotelling T²", "Q residual",
+                                     f"Flags ({a} % limits, |residual| > 3·RMSEC)"], rows)
+
+    def _exclude_outliers(self):
+        flagged = [i for i in getattr(self, "_flagged", []) if i is not None]
+        if not flagged:
+            error(self, "No calibration spectra are flagged at the chosen limit.")
+            return
+        names = ", ".join(self.project.record(i).name for i in flagged)
+        from PySide6.QtWidgets import QMessageBox
+        if QMessageBox.question(self, "Exclude outliers",
+                                f"Uncheck {len(flagged)} calibration spectra and refit?\n\n"
+                                f"{names}") != QMessageBox.Yes:
+            return
+        for i in range(self.cal.count()):
+            if self.cal.item(i).data(Qt.UserRole) in flagged:
+                self.cal.item(i).setCheckState(Qt.Unchecked)
+        self.project.log("CALCULATE", f"Excluded {len(flagged)} outlying calibration spectra "
+                                      f"({self.model.model_type})",
+                         {"inputs": flagged, "limit": self.conf.currentText() + " %"})
+        self._fit()
+
     def _ipls(self):
+        from spectro.ui.widgets import snapshot_resolver
         try:
             m = self._build()
             ids, spectra = self._cal()
             n, ok = QInputDialog.getInt(self, "iPLS", "Number of intervals:", 10, 2, 50)
             if not ok:
                 return
-            out = ipls(m, spectra, self.project.resolver(), n)
+            out = self._work("Interval PLS…", ipls, model=m, spectra=spectra,
+                             resolve=snapshot_resolver(self.project, m.steps), intervals=n)
+        except InterruptedError:
+            return
         except Exception as exc:
             error(self, exc)
             return
@@ -1005,12 +1358,14 @@ class ChemometricsDialog(Base):
         self.project.log("CALCULATE", "iPLS interval selection", {"inputs": ids, "result": out})
 
     def _ga(self):
+        from spectro.ui.widgets import snapshot_resolver
         try:
             m = self._build()
             ids, spectra = self._cal()
-            self.summary.setText("Running genetic algorithm…")
-            self.repaint()
-            out = ga_select(m, spectra, self.project.resolver())
+            out = self._work("Genetic algorithm variable selection…", ga_select, model=m,
+                             spectra=spectra, resolve=snapshot_resolver(self.project, m.steps))
+        except InterruptedError:
+            return
         except Exception as exc:
             error(self, exc)
             return
@@ -1024,11 +1379,13 @@ class ChemometricsDialog(Base):
         if self.model is None:
             error(self, "Fit first.")
             return
-        name, ok = QInputDialog.getText(self, "Save method", "Name:", text=f"{self.model.model_type} model")
+        name, ok = QInputDialog.getText(self, "Save method", "Name:",
+                                        text=f"{self.model.model_type} model")
         if ok:
-            d = self.model.to_dict()
+            d = self.model.to_dict(include_fit=True)
             d["calibration_ids"] = self.cal_ids
             self.method_id = self.project.save_method(name, d, self.win.current_trial())
+            self.win.statusBar().showMessage("Fitted model saved (applies without refitting).")
 
     def _save_results(self):
         if not self.predictions:
@@ -1070,14 +1427,29 @@ class SavedDialog(Base):
         apply_btn.clicked.connect(self._apply)
         arch = QPushButton("Archive method…")
         arch.clicked.connect(self._archive)
-        row.addWidget(apply_btn)
-        row.addWidget(arch)
+        exp = QPushButton("Export model file…")
+        exp.setToolTip("Save the calibrated method/model to a .spmodel file to use in "
+                       "another project or on another PC")
+        exp.clicked.connect(self._export_model)
+        imp = QPushButton("Import model file…")
+        imp.clicked.connect(self._import_model)
+        for b in (apply_btn, exp, imp, arch):
+            row.addWidget(b)
         row.addStretch(1)
         ml.addLayout(row)
         tabs.addTab(mw, "Methods")
+        rw = QWidget()
+        rl = QVBoxLayout(rw)
         self.rtable = QTableWidget()
         self.rtable.itemSelectionChanged.connect(self._show_result)
-        tabs.addTab(self.rtable, "Results")
+        rl.addWidget(self.rtable)
+        xl = QPushButton("Export all results to Excel…")
+        xl.clicked.connect(self.win.export_results)
+        rrow = QHBoxLayout()
+        rrow.addWidget(xl)
+        rrow.addStretch(1)
+        rl.addLayout(rrow)
+        tabs.addTab(rw, "Results")
         lay.addWidget(tabs, 1)
         self.detail = QPlainTextEdit()
         self.detail.setReadOnly(True)
@@ -1102,38 +1474,24 @@ class SavedDialog(Base):
             if d.get("regression"):
                 d["regression"] = {k: v for k, v in d["regression"].items()
                                    if k not in ("x", "y", "residuals")}
+            if d.get("fitted"):
+                d["fitted"] = (f"yes — frozen model, {len(d['fitted']['grid'])} variables "
+                               "(applies without refitting)")
             self.detail.setPlainText(json.dumps(d, indent=2, ensure_ascii=False))
 
     def _show_result(self):
+        from spectro.storage.tables import result_table
+
         r = self.rtable.currentRow()
         if not 0 <= r < len(self.res):
             return
-        data = self.res[r]["data"]
-        ids, found, comps = data.get("ids"), data.get("found"), data.get("compounds")
-        if not (ids and comps and isinstance(found, list) and found
-                and isinstance(found[0], list)):
-            self.out.setRowCount(0)
-            self.detail.setPlainText(json.dumps(data, indent=2, ensure_ascii=False))
-            return
-        rows, recs = [], {c: [] for c in comps}
-        for sid, f in zip(ids, found):
-            try:
-                rec = self.project.record(int(sid))
-            except KeyError:
-                continue
-            row = [rec.name]
-            for c, v in zip(comps, f):
-                t = rec.concentrations.get(c)
-                rv = 100 * v / t if t else None
-                if rv is not None:
-                    recs[c].append(rv)
-                row += [float(v), "" if t is None else float(t), "" if rv is None else rv]
-            rows.append(row)
-        fill_table(self.out, ["Spectrum"] + [h for c in comps for h in
-                                             (f"{c} found", f"{c} taken", f"{c} rec %")], rows)
-        lines = [f"{self.res[r]['name']}  ({self.res[r]['kind']}, {len(rows)} spectra)"]
-        lines += [f"{c}: " + summary_text(v) for c, v in recs.items() if len(v) > 1]
-        self.detail.setPlainText("\n".join(lines))
+        res = self.res[r]
+        headers, rows, summary = result_table(self.project, res["data"])
+        fill_table(self.out, headers, rows)
+        self.out.export_title = res["name"]
+        self.out.export_notes = summary
+        self.detail.setPlainText("\n".join([f"{res['name']}  ({res['kind']}, result #{res['id']})"]
+                                           + summary))
 
     def _archive(self):
         from spectro.ui.widgets import ask_reason
@@ -1144,6 +1502,41 @@ class SavedDialog(Base):
         if reason:
             self.project.archive_method(self.methods[r]["id"], reason)
             self._load()
+
+    def _export_model(self):
+        from spectro.storage.modelfile import export_model
+        r = self.mtable.currentRow()
+        if r < 0:
+            error(self, "Select a method.")
+            return
+        md = self.methods[r]
+        path, _ = QFileDialog.getSaveFileName(self, "Export model", f"{md['name']}.spmodel",
+                                              "Spectro model (*.spmodel)")
+        if not path:
+            return
+        try:
+            doc = export_model(self.project, md)
+            Path(path).write_text(json.dumps(doc, indent=1, ensure_ascii=False), encoding="utf-8")
+        except Exception as exc:
+            error(self, exc)
+            return
+        self.project.log("EXPORT", f"Exported model '{md['name']}'",
+                         {"file": path, "method_id": md["id"], "sha256": doc["sha256"],
+                          "embedded_spectra": list(doc["embedded_spectra"])})
+
+    def _import_model(self):
+        from spectro.storage.modelfile import import_model
+        path, _ = QFileDialog.getOpenFileName(self, "Import model", "",
+                                              "Spectro model (*.spmodel);;All files (*.*)")
+        if not path:
+            return
+        try:
+            doc = json.loads(Path(path).read_text(encoding="utf-8"))
+            import_model(self.project, doc, self.win.current_trial(), path)
+        except Exception as exc:
+            error(self, exc)
+            return
+        self._load()
 
     def _apply(self):
         r = self.mtable.currentRow()
@@ -1168,7 +1561,8 @@ class SavedDialog(Base):
                 found = m.predict(spectra, res).tolist()
                 comps = m.compounds
             else:
-                m.fit(self.project.spectra(d["calibration_ids"]), res)
+                if not m.is_fitted:
+                    m.fit(self.project.spectra(d["calibration_ids"]), res)
                 found = m.predict(spectra, res).tolist()
                 comps = m.compounds
         except Exception as exc:

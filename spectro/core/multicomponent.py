@@ -172,9 +172,21 @@ class SpectralModel:
         X = self.matrix(spectra, resolve)
         Y = concentration_matrix(spectra, self.compounds)
         self._fit_xy(X, Y)
+        self._finish_fit(X, Y)
         return self
 
+    def _finish_fit(self, X: np.ndarray, Y: np.ndarray) -> None:
+        self.state["pca"] = self._fit_pca_limits(X)
+        dof = max(1, X.shape[0] - (1 if self.model_type == "CLS" else
+                                   min(int(self.n_components), X.shape[0] - 1)) - 1)
+        res = self._predict_x(X) - Y
+        self.state["rmsec"] = np.sqrt(np.sum(res ** 2, axis=0) / dof)
+
     def _fit_xy(self, X: np.ndarray, Y: np.ndarray) -> None:
+        self._train_xy(X, Y)
+        self.state["frozen"] = self._freeze(X.shape[1])
+
+    def _train_xy(self, X: np.ndarray, Y: np.ndarray) -> None:
         t = self.model_type
         k = int(self.n_components)
         if t == "CLS":
@@ -271,58 +283,51 @@ class SpectralModel:
         raw = np.array([nnls(S.T, x)[0] for x in X])
         self.state["calib"] = [np.polyfit(raw[:, j], Y[:, j], 1) for j in range(Y.shape[1])]
 
-    # ---------------------------------------------------------------- predict
-    def predict(self, spectra: list[Spectrum], resolve: Resolver | None = None) -> np.ndarray:
-        return self._predict_x(self.matrix(spectra, resolve))
+    # ---------------------------------------------------------------- freeze
+    def _freeze(self, p: int) -> dict:
+        """Reduce the fitted model to plain arrays (JSON-serialisable).
 
-    def _predict_x(self, X: np.ndarray) -> np.ndarray:
-        t = self.model_type
-        st = self.state
+        Prediction always runs from this representation, so a saved or
+        exported model predicts exactly as it did when it was fitted."""
+        t, st = self.model_type, self.state
         if t == "CLS":
-            c, *_ = np.linalg.lstsq(st["K"].T, (X - st["xm"]).T, rcond=None)
-            return c.T + st["ym"]
+            return {"kind": "cls", "K": st["K"], "xm": st["xm"], "ym": st["ym"]}
         if t == "MCR-ALS":
-            raw = np.array([nnls(st["S"].T, x)[0] for x in X])
-            return np.column_stack([np.polyval(st["calib"][j], raw[:, j])
-                                    for j in range(raw.shape[1])])
-        Xp = self._prep(X)
-        ym = st["y_mean"]
+            return {"kind": "mcr", "S": st["S"], "calib": np.array(st["calib"]),
+                    "lof": st["lof"]}
+        base = {"x_mean": st["x_mean"], "x_sd": st["x_sd"], "y_mean": st["y_mean"]}
         if t in ("ILS", "PCR"):
-            return Xp @ st["B"] + ym
-        if t == "PLS2":
-            return st["models"][0].predict(Xp) + ym
-        if t == "PLS1":
-            return np.column_stack([m.predict(Xp).ravel() for m in st["models"]]) + ym
+            return {"kind": "linear", "B": st["B"], "b0": np.zeros(st["B"].shape[1]), **base}
+        if t in ("PLS1", "PLS2") or (t == "SVR" and self.options.get("kernel", "linear") == "linear"):
+            # these predictors are affine in the preprocessed spectrum: recover
+            # the regression vector exactly from p + 1 evaluations
+            f = self._raw_predictor()
+            b0 = f(np.zeros((1, p)))[0]
+            B = f(np.eye(p)) - b0
+            fr = {"kind": "linear", "B": B, "b0": b0, **base}
+            if t in ("PLS1", "PLS2"):
+                fr["vip"] = self._vip_from_models()
+            return fr
         if t == "ANN":
-            T = (Xp @ st["P"]) / st["ts"]
-            out = st["net"].predict(T).reshape(len(X), -1)
-            return out * st["ysd"] + ym
+            net = st["net"]
+            return {"kind": "ann", "P": st["P"], "ts": st["ts"], "ysd": st["ysd"],
+                    "activation": net.activation, "coefs": [c for c in net.coefs_],
+                    "intercepts": [c for c in net.intercepts_], **base}
         if t == "SVR":
-            return np.column_stack([m.predict(Xp) for m in st["models"]]) + ym
+            return {"kind": "svr", **base, "models": [
+                {"kernel": m.kernel, "sv": m.support_vectors_, "dual": m.dual_coef_.ravel(),
+                 "b": float(m.intercept_[0]), "gamma": float(m._gamma),
+                 "degree": int(m.degree), "coef0": float(m.coef0)}
+                for m in st["models"]]}
         raise ValueError(t)
 
-    # ---------------------------------------------------------------- diagnostics
-    def diagnostics(self, spectra: list[Spectrum], resolve: Resolver | None = None) -> dict:
-        """Scores, loadings, Hotelling T², Q residuals (PCA of preprocessed X)."""
-        X = self.matrix(spectra, resolve)
-        mu = X.mean(0)
-        Xc = X - mu
-        k = max(1, min(int(self.n_components), min(Xc.shape) - 1))
-        u, s, vt = np.linalg.svd(Xc, full_matrices=False)
-        T = u[:, :k] * s[:k]
-        P = vt[:k].T
-        E = Xc - T @ P.T
-        lam = (s[:k] ** 2) / max(1, X.shape[0] - 1)
-        t2 = np.sum(T ** 2 / lam, axis=1)
-        q = np.sum(E ** 2, axis=1)
-        return {"scores": T.tolist(), "loadings": P.tolist(), "T2": t2.tolist(),
-                "Q": q.tolist(), "explained": (s ** 2 / np.sum(s ** 2)).tolist(),
-                "grid": self.grid.tolist()}
+    def _raw_predictor(self):
+        st = self.state
+        if self.model_type == "PLS2":
+            return lambda Z: st["models"][0].predict(Z).reshape(len(Z), -1)
+        return lambda Z: np.column_stack([m.predict(Z).ravel() for m in st["models"]])
 
-    def vip(self) -> np.ndarray | None:
-        """Variable importance in projection (PLS models)."""
-        if self.model_type not in ("PLS1", "PLS2"):
-            return None
+    def _vip_from_models(self) -> np.ndarray:
         out = []
         for pls in self.state["models"]:
             t, w, q = pls.x_scores_, pls.x_weights_, pls.y_loadings_
@@ -332,10 +337,131 @@ class SpectralModel:
             out.append(np.sqrt(p * (wn ** 2 @ ss) / ss.sum()))
         return np.mean(out, axis=0)
 
+    @property
+    def is_fitted(self) -> bool:
+        return "frozen" in self.state and self.grid is not None
+
+    # ---------------------------------------------------------------- predict
+    def predict(self, spectra: list[Spectrum], resolve: Resolver | None = None) -> np.ndarray:
+        if not self.is_fitted:
+            raise RuntimeError("model is not fitted")
+        return self._predict_x(self.matrix(spectra, resolve))
+
+    def _predict_x(self, X: np.ndarray) -> np.ndarray:
+        fr = self.state["frozen"]
+        kind = fr["kind"]
+        if kind == "cls":
+            c, *_ = np.linalg.lstsq(np.asarray(fr["K"]).T, (X - fr["xm"]).T, rcond=None)
+            return c.T + fr["ym"]
+        if kind == "mcr":
+            S = np.asarray(fr["S"])
+            raw = np.array([nnls(S.T, x)[0] for x in X])
+            return np.column_stack([np.polyval(fr["calib"][j], raw[:, j])
+                                    for j in range(raw.shape[1])])
+        Xp = (X - fr["x_mean"]) / fr["x_sd"]
+        if kind == "linear":
+            return Xp @ fr["B"] + fr["b0"] + fr["y_mean"]
+        if kind == "ann":
+            h = (Xp @ fr["P"]) / fr["ts"]
+            act = _ACTIVATIONS[fr["activation"]]
+            n = len(fr["coefs"])
+            for i, (W, b) in enumerate(zip(fr["coefs"], fr["intercepts"])):
+                h = h @ W + b
+                if i < n - 1:
+                    h = act(h)
+            return h.reshape(len(X), -1) * fr["ysd"] + fr["y_mean"]
+        if kind == "svr":
+            cols = []
+            for m in fr["models"]:
+                sv = np.asarray(m["sv"])
+                if m["kernel"] == "rbf":
+                    d2 = (np.sum(Xp ** 2, 1)[:, None] + np.sum(sv ** 2, 1)[None, :]
+                          - 2 * Xp @ sv.T)
+                    K = np.exp(-m["gamma"] * d2)
+                elif m["kernel"] == "poly":
+                    K = (m["gamma"] * Xp @ sv.T + m["coef0"]) ** m["degree"]
+                elif m["kernel"] == "sigmoid":
+                    K = np.tanh(m["gamma"] * Xp @ sv.T + m["coef0"])
+                else:
+                    K = Xp @ sv.T
+                cols.append(K @ np.asarray(m["dual"]) + m["b"])
+            return np.column_stack(cols) + fr["y_mean"]
+        raise ValueError(kind)
+
+    # ---------------------------------------------------------------- diagnostics
+    def _fit_pca_limits(self, X: np.ndarray) -> dict:
+        """PCA of the calibration spectra with 95 % / 99 % limits for
+        Hotelling T² (F distribution) and Q residuals (Box's χ² approximation,
+        Q_lim = g·χ²(h) with g = θ2/θ1, h = θ1²/θ2; unlike Jackson–Mudholkar it
+        stays valid when the residual eigenvalues are dominated by noise)."""
+        from scipy import stats
+
+        n = X.shape[0]
+        mu = X.mean(0)
+        Xc = X - mu
+        k = max(1, min(int(self.n_components), min(Xc.shape) - 1))
+        u, s, vt = np.linalg.svd(Xc, full_matrices=False)
+        eig = s ** 2 / max(1, n - 1)
+        out = {"mean": mu, "P": vt[:k].T, "lam": eig[:k], "k": k, "n": n,
+               "explained": s ** 2 / np.sum(s ** 2)}
+        rest = eig[k:]
+        th1, th2 = float(np.sum(rest)), float(np.sum(rest ** 2))
+        for a in (0.95, 0.99):
+            tag = str(int(a * 100))
+            out[f"t2_lim{tag}"] = (k * (n - 1) / (n - k) * stats.f.ppf(a, k, n - k)
+                                   if n > k else float("inf"))
+            out[f"q_lim{tag}"] = (float(th2 / th1 * stats.chi2.ppf(a, th1 ** 2 / th2))
+                                  if th1 > 0 and th2 > 0 else float("inf"))
+        return out
+
+    def _t2_q(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        pca = self.state["pca"]
+        Xc = X - pca["mean"]
+        T = Xc @ pca["P"]
+        E = Xc - T @ np.asarray(pca["P"]).T
+        return np.sum(T ** 2 / pca["lam"], axis=1), np.sum(E ** 2, axis=1), T
+
+    def diagnostics(self, spectra: list[Spectrum], resolve: Resolver | None = None,
+                    alpha: str = "95") -> dict:
+        """Hotelling T² and Q residuals of ``spectra`` against the calibration
+        PCA, with limits and outlier flags (and concentration residuals when
+        reference values are known)."""
+        if "pca" not in self.state:
+            raise RuntimeError("fit the model first")
+        pca = self.state["pca"]
+        X = self.matrix(spectra, resolve)
+        t2, q, T = self._t2_q(X)
+        t2_lim, q_lim = pca[f"t2_lim{alpha}"], pca[f"q_lim{alpha}"]
+        flags = []
+        pred = self._predict_x(X)
+        rmsec = self.state.get("rmsec")
+        for i, s in enumerate(spectra):
+            f = []
+            if t2[i] > t2_lim:
+                f.append("T²")
+            if q[i] > q_lim:
+                f.append("Q")
+            if rmsec is not None:
+                for j, c in enumerate(self.compounds):
+                    ref = s.concentrations.get(c)
+                    if ref is not None and rmsec[j] > 0 and abs(pred[i, j] - ref) > 3 * rmsec[j]:
+                        f.append(f"{c} residual")
+            flags.append(f)
+        return {"scores": T.tolist(), "loadings": np.asarray(pca["P"]).tolist(),
+                "T2": t2.tolist(), "Q": q.tolist(), "explained": np.asarray(pca["explained"]).tolist(),
+                "grid": self.grid.tolist(), "flags": flags,
+                "limits": {k: float(v) for k, v in pca.items() if k.startswith(("t2_lim", "q_lim"))},
+                "predicted": pred.tolist()}
+
+    def vip(self) -> np.ndarray | None:
+        """Variable importance in projection (PLS models)."""
+        fr = self.state.get("frozen", {})
+        return None if fr.get("vip") is None else np.asarray(fr["vip"])
+
     # ---------------------------------------------------------------- CV
     def cross_validate(self, spectra: list[Spectrum], resolve: Resolver | None = None,
                        method: str = "loo", folds: int = 5,
-                       max_components: int | None = None) -> dict:
+                       max_components: int | None = None, progress=None) -> dict:
         """Cross-validation; for latent-variable models also RMSECV vs number
         of components (and the Haaland–Thomas choice, F-test α = 0.25)."""
         self.grid = None
@@ -349,6 +475,7 @@ class SpectralModel:
         curve = []
         best_pred = None
         saved = self.n_components
+        total, done = len(ks) * len(splits), 0
         for k in ks:
             self.n_components = k
             pred = np.zeros_like(Y)
@@ -357,6 +484,9 @@ class SpectralModel:
                 self.state = {}
                 self._fit_xy(X[train], Y[train])
                 pred[test] = self._predict_x(X[test])
+                done += 1
+                if progress is not None and progress(done, total) is False:
+                    raise InterruptedError("cancelled")
             press = np.sum((pred - Y) ** 2, axis=0)
             curve.append({"k": k, "PRESS": press.tolist(),
                           "RMSECV": np.sqrt(press / n).tolist()})
@@ -379,25 +509,72 @@ class SpectralModel:
                     break
         self.state = {}
         self._fit_xy(X, Y)
+        self._finish_fit(X, Y)
         return {"curve": curve, "suggested_components": suggested,
                 "predicted": best_pred.tolist(), "actual": Y.tolist(),
                 "stats": {c: prediction_error(best_pred[:, j], Y[:, j])
                           for j, c in enumerate(self.compounds)}}
 
     # ---------------------------------------------------------------- persist
-    def to_dict(self) -> dict:
-        return {"type": "spectral", "model_type": self.model_type,
-                "compounds": self.compounds, "steps": self.steps,
-                "ranges": [list(r) for r in self.ranges], "wavelengths": self.wavelengths,
-                "n_components": self.n_components, "preprocessing": self.preprocessing,
-                "options": self.options}
+    def to_dict(self, include_fit: bool = False) -> dict:
+        d = {"type": "spectral", "model_type": self.model_type,
+             "compounds": self.compounds, "steps": self.steps,
+             "ranges": [list(r) for r in self.ranges], "wavelengths": self.wavelengths,
+             "n_components": self.n_components, "preprocessing": self.preprocessing,
+             "options": self.options}
+        if include_fit and self.is_fitted:
+            d["fitted"] = {"grid": _plain(self.grid), "frozen": _plain(self.state["frozen"]),
+                           "pca": _plain(self.state.get("pca")),
+                           "rmsec": _plain(self.state.get("rmsec"))}
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "SpectralModel":
-        return cls(d["model_type"], d["compounds"], d.get("steps", []),
-                   [tuple(r) for r in d.get("ranges", [])], d.get("wavelengths", []),
-                   d.get("n_components", 2), d.get("preprocessing", "mean_center"),
-                   d.get("options", {}))
+        m = cls(d["model_type"], d["compounds"], d.get("steps", []),
+                [tuple(r) for r in d.get("ranges", [])], d.get("wavelengths", []),
+                d.get("n_components", 2), d.get("preprocessing", "mean_center"),
+                d.get("options", {}))
+        fit = d.get("fitted")
+        if fit:
+            m.grid = np.asarray(fit["grid"], float)
+            m.state = {"frozen": _arrays(fit["frozen"])}
+            if fit.get("pca"):
+                m.state["pca"] = _arrays(fit["pca"])
+            if fit.get("rmsec") is not None:
+                m.state["rmsec"] = np.asarray(fit["rmsec"], float)
+        return m
+
+
+_ACTIVATIONS = {"identity": lambda x: x, "logistic": lambda x: 1 / (1 + np.exp(-x)),
+                "tanh": np.tanh, "relu": lambda x: np.maximum(x, 0)}
+
+def _plain(obj):
+    """numpy → nested lists (JSON)."""
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.floating, np.integer)):
+        return obj.item()
+    if isinstance(obj, dict):
+        return {k: _plain(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_plain(v) for v in obj]
+    return obj
+
+
+def _arrays(obj, key: str = ""):
+    """Nested lists → numpy arrays (inverse of :func:`_plain`)."""
+    if isinstance(obj, dict):
+        return {k: _arrays(v, k) for k, v in obj.items()}
+    if isinstance(obj, list):
+        if key in ("coefs", "intercepts"):
+            return [np.asarray(v, float) for v in obj]
+        if key == "models":
+            return [_arrays(v) for v in obj]
+        try:
+            return np.asarray(obj, float)
+        except (ValueError, TypeError):
+            return [_arrays(v) for v in obj]
+    return obj
 
 
 def _cv_splits(n: int, method: str, folds: int) -> list[np.ndarray]:
@@ -416,7 +593,7 @@ def _cv_splits(n: int, method: str, folds: int) -> list[np.ndarray]:
 # Variable selection
 # --------------------------------------------------------------------------- #
 def ipls(model: SpectralModel, spectra: list[Spectrum], resolve: Resolver | None = None,
-         intervals: int = 10) -> list[dict]:
+         intervals: int = 10, progress=None) -> list[dict]:
     """Interval PLS: RMSECV of the model on each of ``intervals`` equal regions."""
     base = SpectralModel.from_dict(model.to_dict())
     base.ranges = []
@@ -425,7 +602,9 @@ def ipls(model: SpectralModel, spectra: list[Spectrum], resolve: Resolver | None
     grid = base.grid
     edges = np.array_split(np.arange(grid.size), intervals)
     out = []
-    for e in edges:
+    for n_done, e in enumerate(edges, 1):
+        if progress is not None and progress(n_done - 1, len(edges)) is False:
+            raise InterruptedError("cancelled")
         if e.size < 2:
             continue
         m = SpectralModel.from_dict(model.to_dict())
@@ -445,7 +624,7 @@ def ipls(model: SpectralModel, spectra: list[Spectrum], resolve: Resolver | None
 
 def ga_select(model: SpectralModel, spectra: list[Spectrum], resolve: Resolver | None = None,
               intervals: int = 20, population: int = 20, generations: int = 20,
-              seed: int = 0) -> dict:
+              seed: int = 0, progress=None) -> dict:
     """Genetic-algorithm interval selection (GA-PLS style) minimising RMSECV."""
     rng = np.random.default_rng(seed)
     base = SpectralModel.from_dict(model.to_dict())
@@ -468,7 +647,9 @@ def ga_select(model: SpectralModel, spectra: list[Spectrum], resolve: Resolver |
 
     pop = rng.random((population, len(blocks))) < 0.5
     scores = np.array([fitness(p) for p in pop])
-    for _ in range(generations):
+    for gen in range(generations):
+        if progress is not None and progress(gen, generations) is False:
+            raise InterruptedError("cancelled")
         order = np.argsort(scores)
         parents = pop[order[: population // 2]]
         children = []

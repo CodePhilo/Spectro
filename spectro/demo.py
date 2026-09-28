@@ -140,7 +140,7 @@ def build_demo_project(path: str | Path,
           {"inputs": train, "curve": cv["curve"], "suggested": cv["suggested_components"]})
     pls.n_components = cv["suggested_components"]
     pls.fit(p.spectra(train))
-    d = pls.to_dict()
+    d = pls.to_dict(include_fit=True)
     d["calibration_ids"] = train
     mid = p.save_method(f"PLS2 ({pls.n_components} LVs, 215–310 nm)", d, tt)
     targets = val + exc

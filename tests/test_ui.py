@@ -144,3 +144,149 @@ def test_tools_and_report(win, tmp_path):
     SpecialDialog(win)
     doc = build_html(win.project, win.project.trials()[0]["id"], include_plot=True)
     assert "Audit trail" in doc and "PASSED" in doc
+
+
+def test_view_modes_and_figure_export(win, tmp_path, monkeypatch):
+    from spectro.ui.figure import FigureDialog, collect_series, render
+    recs = win.project.records()
+    select(win, [r.id for r in recs if r.role == "standard"][:4])
+    for mode in ("Stacked", "Difference", "Normalized", "Overlay"):
+        win.view_cb.setCurrentText(mode)
+        assert len(win.plot.curves) >= 3
+    win.view_cb.setCurrentText("Stacked")
+    ys = [c.values.max() for _, c in win.plot.curves]
+    assert ys == sorted(ys)
+    data = collect_series(win.plot)
+    assert len(data["series"]) == 4 and data["xlabel"].startswith("Wavelength")
+    dlg = FigureDialog(win.plot, win)
+    opts = dlg.options()
+    for ext in ("png", "tif", "svg", "pdf"):
+        fig = render(data, {**opts, "black_white": ext == "pdf"}, dpi=300)
+        fig.savefig(tmp_path / f"f.{ext}", dpi=300)
+        assert (tmp_path / f"f.{ext}").stat().st_size > 1000
+    from PIL import Image
+    im = Image.open(tmp_path / "f.tif")
+    assert abs(im.size[0] - round(85 / 25.4 * 300)) <= 2
+
+
+def test_table_export_and_results_excel(win, tmp_path, monkeypatch):
+    import openpyxl
+    from spectro.ui import widgets
+    from spectro.ui.widgets import PasteTable, fill_table
+    t = PasteTable()
+    fill_table(t, ["A", "B"], [["x", 1.23456789]])
+    monkeypatch.setattr(widgets.QFileDialog, "getSaveFileName",
+                        lambda *a, **k: (str(tmp_path / "t.xlsx"), ""))
+    t.export_excel()
+    assert openpyxl.load_workbook(tmp_path / "t.xlsx").active["B2"].value == 1.23456789
+    assert win.project.audit_entries(action="EXPORT")
+
+
+def test_standard_addition_and_robustness_ui(win, monkeypatch):
+    from spectro.ui.dialogs_methods import RobustnessDialog, UnivariateDialog
+    p = win.project
+    tid = p.trials()[0]["id"]
+    spikes = []
+    for i, a in enumerate([0, 0, 2, 4, 6]):
+        s = mixture({"X": 5 + a, "Y": 8}, f"spiked {i}")
+        s.concentrations = {"X": float(a)}
+        spikes.append(p.add_spectrum(s, tid, role="sample"))
+    d = UnivariateDialog(win)
+    d.compound.setCurrentText("X")
+    d.template.setCurrentText("Ratio difference (RD)")
+    ydiv = next(r for r in p.records() if r.name == "Y 20")
+    st = d.pipe.get_steps()
+    st[0]["params"]["reference"] = ydiv.id
+    d.pipe.set_steps(st)
+    d.meas.form.set_value("w1", 240.0)
+    d.meas.form.set_value("w2", 260.0)
+    d._calibrate()
+    d.test.set_all(False)
+    for i in range(d.test.count()):
+        if d.test.item(i).data(Qt.UserRole) in spikes:
+            d.test.item(i).setCheckState(Qt.Checked)
+    d._std_addition()
+    kind, data = d.last[1], d.last[2]
+    assert kind == "standard_addition" and abs(data["sample"] - 5) < 0.1
+    assert abs(data["mean_recovery"] - 100) < 2
+    d._save_results()
+    rob = RobustnessDialog(d, d.method, p.spectra(d.cal_ids), p.spectra(spikes[2:]))
+    rob._run()
+    assert rob.result_data and len(rob.result_data["variants"]) == 5
+
+
+def test_chemometrics_limits_outliers_and_models(win, monkeypatch, tmp_path):
+    from spectro.ui import dialogs_methods as dm
+    c = dm.ChemometricsDialog(win)
+    c.mtype.setCurrentText("PLS2")
+    c.ncomp.setValue(3)
+    c._fit()
+    assert c.model.is_fitted and c.diag_table.rowCount() > 0
+    c.conf.setCurrentText("99")
+    monkeypatch.setattr(dm.QInputDialog, "getText", lambda *a, **k: ("PLS model", True))
+    c._save_method()
+    saved = [m for m in win.project.methods() if m["name"] == "PLS model"][0]
+    assert saved["definition"]["fitted"]
+    c._flagged = [c.cal.item(0).data(Qt.UserRole)]
+    from PySide6.QtWidgets import QMessageBox
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.Yes)
+    c._exclude_outliers()
+    assert c.cal.item(0).checkState() == Qt.Unchecked
+    c._cv()
+    s = dm.SavedDialog(win)
+    s.rtable.selectRow(0)
+    s._show_result()
+    path = tmp_path / "m.spmodel"
+    monkeypatch.setattr(dm.QFileDialog, "getSaveFileName", lambda *a, **k: (str(path), ""))
+    monkeypatch.setattr(dm.QFileDialog, "getOpenFileName", lambda *a, **k: (str(path), ""))
+    s.mtable.selectRow(len(s.methods) - 1)
+    s._export_model()
+    n = len(win.project.methods())
+    s._import_model()
+    assert len(win.project.methods()) == n + 1
+
+
+def test_new_binary_tabs(win):
+    from spectro.ui.dialogs_methods import SpecialDialog
+    d = SpecialDialog(win)
+    recs = win.project.records()
+
+    def check(lst, pred):
+        for i in range(lst.count()):
+            rid = lst.item(i).data(Qt.UserRole)
+            r = next(x for x in recs if x.id == rid)
+            lst.item(i).setCheckState(Qt.Checked if pred(r) else Qt.Unchecked)
+    x_std = lambda r: r.name.startswith("X ")  # noqa: E731
+    y_std = lambda r: r.name.startswith("Y ")  # noqa: E731
+    mix = lambda r: r.name.startswith("mix")  # noqa: E731
+    d.iam_y.setCurrentText("Y")
+    d.iam_w.setValue(250)
+    d.iam_p1.setValue(340)
+    d.iam_p2.setValue(360)
+    check(d.iam_xs, x_std)
+    check(d.iam_ys, y_std)
+    check(d.iam_mix, mix)
+    d._run_iam()
+    found = d.last[1]["found"]
+    assert abs(found[0]["X"] - 6) < 0.15 and abs(found[0]["Y"] - 10) < 0.15
+    d.aas_y.setCurrentText("Y")
+    d.aas_w2.setValue(245)
+    check(d.aas_xs, x_std)
+    check(d.aas_ys, y_std)
+    check(d.aas_mix, mix)
+    from spectro.core import univariate as uv
+    d.aas_w1.setValue(uv.equal_amplitude_wavelengths(win.project.spectrum(
+        next(r.id for r in recs if r.name == "Y 20")), 245.0)[0])
+    d._run_aas()
+    found = d.last[1]["found"]
+    assert abs(found[0]["X"] - 6) < 0.15 and abs(found[0]["Y"] - 10) < 0.15
+
+
+def test_default_selection_excludes_derived(win):
+    from spectro.ui.dialogs_methods import checklists
+    p = win.project
+    std = [r.id for r in p.records() if r.role == "standard"]
+    derived = p.process(std, [{"op": "derivative", "params": {"order": 1}}])
+    cal, test = checklists(p, "X")
+    assert not set(cal.checked_ids()) & set(derived)
+    assert set(cal.checked_ids()) <= set(std)

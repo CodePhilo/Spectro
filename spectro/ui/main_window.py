@@ -8,6 +8,7 @@ from pathlib import Path
 from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDockWidget,
+                               QDoubleSpinBox,
                                QFileDialog, QFormLayout, QHBoxLayout, QInputDialog, QLabel,
                                QLineEdit, QListWidget, QMainWindow, QMessageBox, QPushButton,
                                QTabWidget, QTableWidget, QTreeWidget, QTreeWidgetItem,
@@ -16,7 +17,9 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDock
 from spectro import __version__
 from spectro.core.operations import describe_step
 from spectro.storage.project import ROLES, Project
-from spectro.ui.widgets import PasteTable, SpectrumPlot, ask_reason, error, fill_table
+from spectro.ui import widgets
+from spectro.ui.widgets import (VIEW_MODES, PasteTable, SpectrumPlot, ask_reason, error,
+                                fill_table)
 
 APP = "Spectro"
 
@@ -36,7 +39,35 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         self.plot = SpectrumPlot()
         self.plot.hovered.connect(lambda t: self.statusBar().showMessage(t))
-        self.setCentralWidget(self.plot)
+        central = QWidget()
+        cv = QVBoxLayout(central)
+        cv.setContentsMargins(0, 0, 0, 0)
+        bar = QHBoxLayout()
+        bar.setContentsMargins(6, 4, 6, 0)
+        self.view_cb = QComboBox()
+        self.view_cb.addItems(list(VIEW_MODES))
+        self.view_cb.setToolTip("Overlay · Stacked (offset) · Difference (each minus the first "
+                                "selected) · Normalized (max = 1)")
+        self.offset_sb = QDoubleSpinBox()
+        self.offset_sb.setDecimals(4)
+        self.offset_sb.setRange(0, 1e6)
+        self.offset_sb.setSingleStep(0.05)
+        self.offset_sb.setSpecialValueText("auto")
+        self.offset_sb.setToolTip("Offset between stacked spectra (0 = automatic)")
+        self.offset_sb.setEnabled(False)
+        self.view_cb.currentTextChanged.connect(self._view_changed)
+        self.offset_sb.valueChanged.connect(self._view_changed)
+        fig_btn = QPushButton("Export figure…")
+        fig_btn.clicked.connect(self.export_figure)
+        bar.addWidget(QLabel("View"))
+        bar.addWidget(self.view_cb)
+        bar.addWidget(QLabel("Offset"))
+        bar.addWidget(self.offset_sb)
+        bar.addStretch(1)
+        bar.addWidget(fig_btn)
+        cv.addLayout(bar)
+        cv.addWidget(self.plot, 1)
+        self.setCentralWidget(central)
 
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["Name", "Role", "Pts", "Concentrations"])
@@ -142,6 +173,9 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         act(m, "&Import spectra (any instrument / Excel / CSV)…", self.import_spectra, "Ctrl+I")
         act(m, "&Export selected spectra…", self.export_spectra, "Ctrl+E")
+        act(m, "Export &figure (publication quality)…", self.export_figure, "Ctrl+Shift+E",
+            needs_project=False)
+        act(m, "Export results to E&xcel…", self.export_results)
         act(m, "Trial &report (PDF/HTML)…", self.report)
         m.addSeparator()
         act(m, "E&xit", self.close, "Ctrl+Q", False)
@@ -250,6 +284,8 @@ class MainWindow(QMainWindow):
 
     def _attach(self, proj: Project) -> None:
         self.project = proj
+        widgets.EXPORT_HOOK = lambda summary, details: self.project.log("EXPORT", summary,
+                                                                       details)
         proj.subscribe(self._changed)
         self._remember(proj.path)
         self._update_enabled()
@@ -257,6 +293,7 @@ class MainWindow(QMainWindow):
         self.refresh_audit()
 
     def close_project(self) -> None:
+        widgets.EXPORT_HOOK = None
         if self.project:
             self.project.close()
             self.project = None
@@ -582,6 +619,43 @@ class MainWindow(QMainWindow):
                                     "data hashes.")
         else:
             QMessageBox.critical(self, "Integrity check FAILED", "\n".join(rep["problems"][:30]))
+
+    def _view_changed(self, *_):
+        mode = self.view_cb.currentText()
+        self.offset_sb.setEnabled(mode == "Stacked")
+        self.plot.set_view(mode, self.offset_sb.value())
+
+    def export_figure(self):
+        from spectro.ui.figure import FigureDialog
+
+        if not self.plot.curves:
+            error(self, "Select spectra to plot first.")
+            return
+        FigureDialog(self.plot, self).exec()
+
+    def export_results(self):
+        from spectro.storage.tables import export_results_excel
+
+        trials = self.project.trials()
+        labels = ["(all trials)"] + [t["name"] for t in trials]
+        choice, ok = QInputDialog.getItem(self, "Export results", "Trial:", labels, 0, False)
+        if not ok:
+            return
+        tid = None if choice == labels[0] else trials[labels.index(choice) - 1]["id"]
+        path, _ = QFileDialog.getSaveFileName(self, "Export results", "results.xlsx",
+                                              "Excel (*.xlsx)")
+        if not path:
+            return
+        if not path.lower().endswith(".xlsx"):
+            path += ".xlsx"
+        try:
+            n = export_results_excel(self.project, path, tid)
+        except Exception as exc:
+            error(self, exc)
+            return
+        self.project.log("EXPORT", f"Exported {n} results to Excel", {"file": path,
+                                                                      "trial_id": tid})
+        self.statusBar().showMessage(f"Exported {n} results to {path}")
 
     def open_demo(self):
         from spectro.demo import build_demo_project

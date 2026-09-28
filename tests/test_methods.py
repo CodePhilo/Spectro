@@ -293,3 +293,132 @@ def test_regression_statistics():
     assert r.r > 0.999 and abs(r.slope - 0.05) < 1e-3
     assert r.lod < r.loq
     assert abs(float(r.predict_x(0.25)) - 5) < 0.05
+
+
+# --------------------------------------------------------------------------- #
+# added methods: DAD, ERS, IAM, AAS, standard addition, robustness
+# --------------------------------------------------------------------------- #
+def test_dual_amplitude_difference_ternary(pure):
+    lib = dict(pure)
+    res = lambda k: lib[k]  # noqa: E731
+    # ratio spectra by Z; choose λ pair where Y/Z has equal amplitude
+    yz = apply_pipeline(pure["Y"], [{"op": "crop", "params": {"start": 215.0, "end": 300.0}},
+                                    {"op": "divide", "params": {"reference": "Z"}}], res)
+    pairs = uv.equal_amplitude_wavelengths(yz, 240.0, 220, 290)
+    assert pairs
+    steps = [{"op": "crop", "params": {"start": 215.0, "end": 300.0}},
+             {"op": "divide", "params": {"reference": "Z"}}]
+    m = uv.UnivariateMethod("DAD", "X", steps, {"kind": "weighted_difference", "params": {
+        "w1": 240.0, "w2": pairs[0], "reference": "Y"}})
+    m.calibrate([mixture({"X": c}) for c in (4, 8, 12, 16, 20)], res)
+    for a, b, c in [(6, 10, 8), (12, 6, 14), (16, 12, 5)]:
+        assert close(m.predict(mixture({"X": a, "Y": b, "Z": c}), res), a)
+
+
+def test_extended_ratio_subtraction_and_double_divisor(binary_set, pure):
+    xs, ys, mixes = binary_set
+    res = resolver(pure)
+    ers = uv.UnivariateMethod("ERS", "Y", [{"op": "extended_ratio_subtraction", "params": {
+        "divisor": "pure:Y", "reference": "pure:X", "start": 340.0, "end": 360.0}}],
+        {"kind": "amplitude", "params": {"w1": 275.0}})
+    ers.calibrate(ys, res)
+    for mix in mixes:
+        assert close(ers.predict(mix, res), mix.concentrations["Y"])
+    out = apply_pipeline(mixes[0], [{"op": "divide_sum", "params": {
+        "reference": "pure:Y", "reference2": "pure:Z"}}], res)
+    assert np.all(np.isfinite(out.values))
+
+
+def test_induced_amplitude_modulation_and_aas(binary_set, pure):
+    xs, ys, mixes = binary_set
+    div = uv.InducedAmplitudeModulation.unit_divisor(ys, "Y")
+    iam = uv.InducedAmplitudeModulation(250.0, (340.0, 360.0))
+    iam.fit(xs, "X", div)
+    for mix in mixes:
+        r = iam.predict(mix, div)
+        assert close(r["X"], mix.concentrations["X"]) and close(r["Y"], mix.concentrations["Y"])
+    w1 = uv.equal_amplitude_wavelengths(pure["Y"], 245.0, 200, 400)[0]
+    aas = uv.AdvancedAbsorbanceSubtraction(w1, 245.0)
+    aas.fit(xs, "X", ys, "Y")
+    for mix in mixes:
+        r = aas.predict(mix)
+        assert close(r["X"], mix.concentrations["X"]) and close(r["Y"], mix.concentrations["Y"])
+
+
+def test_standard_addition_and_robustness(binary_set, pure):
+    xs, ys, mixes = binary_set
+    res = resolver(pure)
+    m = uv.UnivariateMethod("RD", "X", [{"op": "divide", "params": {"reference": "pure:Y"}}],
+                            {"kind": "difference", "params": {"w1": 240.0, "w2": 260.0}})
+    m.calibrate(xs, res)
+    added = [0, 0, 2, 4, 6]
+    spiked = [mixture({"X": 5 + a, "Y": 8}) for a in added]
+    sa = uv.standard_addition_recovery(lambda s: m.predict(s, res), spiked, added)
+    assert abs(sa["sample"] - 5) < 0.05 and abs(sa["mean_recovery"] - 100) < 1
+    assert abs(sa["extrapolated"] - 5) < 0.1
+    params = uv.numeric_parameters(m)
+    assert [p["label"] for p in params][-2:] == ["Measurement λ1", "Measurement λ2"]
+    rob = uv.robustness_study(m, xs, mixes, params[-2:], res)
+    assert len(rob["variants"]) == 5 and rob["max_abs_deviation"] < 2
+
+
+# --------------------------------------------------------------------------- #
+# chemometrics extras: frozen models, limits, outliers, progress
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("mtype,opts", [("CLS", {}), ("ILS", {}), ("PCR", {}), ("PLS1", {}),
+                                        ("PLS2", {}), ("MCR-ALS", {}), ("ANN", {}),
+                                        ("SVR", {"kernel": "linear"}),
+                                        ("SVR", {"kernel": "rbf", "C": 1000.0})])
+def test_model_roundtrip_predicts_identically(mtype, opts):
+    import json
+    cal = _design_set()
+    test = [mixture({"X": 8, "Y": 12, "Z": 9}), mixture({"X": 13, "Y": 7, "Z": 11})]
+    m = SpectralModel(mtype, ["X", "Y", "Z"], ranges=[(210, 370)], n_components=3,
+                      wavelengths=[225, 245, 260, 275, 330], options=opts)
+    m.fit(cal)
+    before = m.predict(test)
+    d = json.loads(json.dumps(m.to_dict(include_fit=True)))
+    m2 = SpectralModel.from_dict(d)
+    assert m2.is_fitted
+    assert np.allclose(m2.predict(test), before, rtol=1e-9, atol=1e-9)
+
+
+def test_limits_and_outlier_flags():
+    cal = _design_set()
+    m = SpectralModel("PLS2", ["X", "Y", "Z"], n_components=3).fit(cal)
+    d = m.diagnostics(cal)
+    lim = d["limits"]
+    assert lim["t2_lim99"] > lim["t2_lim95"] > 0 and lim["q_lim99"] > lim["q_lim95"] > 0
+    # an unexpected fourth absorber is flagged by Q; a wrong reference value by residual
+    bad = mixture({"X": 10, "Y": 10, "Z": 10})
+    bad = bad.copy(values=bad.values + 0.3 * np.exp(-0.5 * ((GRID - 300) / 6) ** 2))
+    wrong = mixture({"X": 10, "Y": 10, "Z": 10})
+    wrong.concentrations["X"] = 14.0
+    flags = m.diagnostics([bad, wrong])["flags"]
+    assert "Q" in flags[0] and "X residual" in flags[1]
+    assert m.vip() is not None
+
+
+def test_progress_and_cancel():
+    cal = _design_set()
+    m = SpectralModel("PLS2", ["X", "Y", "Z"], n_components=3)
+    calls = []
+    m.cross_validate(cal, method="venetian", folds=5, max_components=3,
+                     progress=lambda d, t: calls.append((d, t)))
+    assert calls[-1] == (15, 15)
+    with pytest.raises(InterruptedError):
+        m.cross_validate(cal, method="venetian", folds=5, max_components=3,
+                         progress=lambda d, t: d < 4)
+    with pytest.raises(InterruptedError):
+        ipls(m, cal, intervals=4, progress=lambda d, t: False)
+
+
+def test_q_limit_flags_few_calibration_samples():
+    """At 95 % about 5 % of normal calibration samples may exceed the limits."""
+    cal = [mixture(c, f"D{i}", 0.001, seed=100 + i) for i, c in enumerate(
+        design_concentrations({"X": 10, "Y": 10, "Z": 10}, {"X": 4, "Y": 4, "Z": 4}))]
+    m = SpectralModel("PLS2", ["X", "Y", "Z"], n_components=3).fit(cal)
+    d = m.diagnostics(cal)
+    q_out = np.mean(np.array(d["Q"]) > d["limits"]["q_lim95"])
+    assert q_out <= 0.15
+    assert d["limits"]["q_lim95"] > np.mean(d["Q"])

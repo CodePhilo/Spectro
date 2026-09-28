@@ -375,16 +375,16 @@ Please tick what you accept, strike what you reject, and add comments.
 
 ---
 
-## 13. Implementation status (v0.1)
+## 13. Implementation status (v0.2)
 
 | Milestone | Status | Notes |
 |---|---|---|
 | M0 Foundation | ✅ | SQLite project file; append‑only, hash‑chained audit (DB triggers block UPDATE/DELETE); every mutating call logs in the same transaction; integrity check of the chain and every spectrum's data hash |
 | M1 Import & view | ✅ | Layout‑driven text/CSV parser (delimiter, decimal comma, headers, columns / XY pairs / rows, UTF‑16), Excel .xlsx/.xls, JCAMP‑DX (incl. ASDF compression), GRAMS SPC (new and old formats), OLE .spc (e.g. Shimadzu); project tree, overlay plot with crosshair, properties, metadata, lineage, per‑spectrum history |
-| M2 Pre‑processing & pipelines | ✅ | 27 registered operations with auto‑generated forms, live preview, derived spectra with lineage, "recompute from raw" verification |
-| M3 Univariate methods | ✅ | Generic pipeline + measurement + calibration (19 templates), equation methods (Vierordt, multi‑λ LS, bivariate + Kaiser, AUC), Q‑analysis, absorbance subtraction, amplitude modulation, HPSAM, finder tools |
-| M4 Validation & reports | ✅ | ICH Q2 statistics; PDF/HTML trial report with audit trail |
-| M5 Chemometrics | ✅ | CLS, ILS, PCR, PLS1/2, MCR‑ALS, ANN, SVR, CV, iPLS, GA, VIP, T²/Q, Brereton design |
+| M2 Pre‑processing & pipelines | ✅ | 29 registered operations with auto‑generated forms, live preview, derived spectra with lineage, "recompute from raw" verification |
+| M3 Univariate methods | ✅ | Generic pipeline + measurement + calibration (22 templates incl. dual amplitude difference, extended ratio subtraction, successive spectrum subtraction, double divisor), equation methods (Vierordt, multi‑λ LS, bivariate + Kaiser, AUC), Q‑analysis, absorbance subtraction, advanced absorbance subtraction, amplitude modulation, induced amplitude modulation, HPSAM, finder tools; standard addition and robustness studies |
+| M4 Validation & reports | ✅ | ICH Q2 statistics; PDF/HTML trial report with audit trail; Excel export of results and tables; publication figures (matplotlib); stacked / difference / normalized views |
+| M5 Chemometrics | ✅ | CLS, ILS, PCR, PLS1/2, MCR‑ALS, ANN, SVR, CV, iPLS, GA, VIP, Brereton design; T² / Q limits (F, Box χ²), outlier flags and exclusion; frozen fitted models, `.spmodel` export/import; background work with progress/cancel |
 | M7 Packaging | ✅ (CI) | PyInstaller build verified on Linux; Windows `.exe` built by GitHub Actions |
 | Formal CSV documentation | ⏳ | Deferred per review |
 

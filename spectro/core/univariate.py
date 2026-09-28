@@ -32,6 +32,7 @@ bivariate, AUC-equations) are in :mod:`spectro.core.multicomponent`.
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -140,7 +141,23 @@ class UnivariateMethod:
     regression: Regression | None = None
 
     def signal(self, s: Spectrum, resolve: Resolver | None = None) -> float:
-        return measure(apply_pipeline(s, self.steps, resolve), self.measurement, resolve)
+        return measure(apply_pipeline(s, self.steps, resolve), self._measurement(resolve),
+                       resolve)
+
+    def _measurement(self, resolve: Resolver | None) -> dict:
+        """For P(λ1) − F·P(λ2) with an interferent reference, F is computed on
+        the interferent *after the same processing* (e.g. its ratio spectrum),
+        which is what the dual amplitude difference method requires."""
+        m = self.measurement
+        p = m.get("params", {})
+        if m["kind"] != "weighted_difference" or p.get("factor") is not None \
+                or p.get("reference") is None:
+            return m
+        ref = p["reference"]
+        ref = ref if isinstance(ref, Spectrum) else resolve(ref)
+        proc = apply_pipeline(ref, self.steps, resolve)
+        f = proc.value_at(p["w1"]) / proc.value_at(p["w2"])
+        return {"kind": m["kind"], "params": {**p, "factor": float(f)}}
 
     def calibrate(self, spectra: list[Spectrum], resolve: Resolver | None = None,
                   concentrations: list[float] | None = None) -> Regression:
@@ -217,9 +234,24 @@ TEMPLATES: dict[str, dict[str, Any]] = {
                   {"op": "derivative", "params": {"order": 1, "delta_lambda": 4.0}}],
         "measurement": {"kind": "amplitude", "params": {"w1": 260.0}}},
     "Double divisor ratio derivative (ternary)": {
-        "steps": [{"op": "divide", "params": {"reference": None}},
+        "steps": [{"op": "divide_sum", "params": {"reference": None, "reference2": None}},
                   {"op": "derivative", "params": {"order": 1, "delta_lambda": 4.0}}],
         "measurement": {"kind": "amplitude", "params": {"w1": 260.0}}},
+    "Dual amplitude difference (ternary)": {
+        "steps": [{"op": "divide", "params": {"reference": None}}],
+        "measurement": {"kind": "weighted_difference",
+                        "params": {"w1": 240.0, "w2": 260.0, "reference": None}}},
+    "Extended ratio subtraction (Y)": {
+        "steps": [{"op": "extended_ratio_subtraction",
+                   "params": {"divisor": None, "reference": None, "start": 300.0,
+                              "end": 320.0}}],
+        "measurement": {"kind": "amplitude", "params": {"w1": 275.0}}},
+    "Successive spectrum subtraction (ternary)": {
+        "steps": [{"op": "spectrum_subtraction",
+                   "params": {"reference": None, "wavelength": 340.0, "derivative_order": 0}},
+                  {"op": "ratio_subtraction",
+                   "params": {"divisor": None, "start": 290.0, "end": 310.0}}],
+        "measurement": {"kind": "amplitude", "params": {"w1": 245.0}}},
     "Ratio subtraction (X)": {
         "steps": [{"op": "ratio_subtraction", "params": {"divisor": None, "start": 300.0,
                                                           "end": 320.0}}],
@@ -398,3 +430,190 @@ def hpsam(added: list[float], mixtures: list[Spectrum], w1: float, w2: float) ->
     ch = (r2.intercept - r1.intercept) / (r1.slope - r2.slope)
     ah = r1.intercept + r1.slope * ch
     return {"X": float(-ch), "A_H": float(ah), "line1": r1.to_dict(), "line2": r2.to_dict()}
+
+
+@dataclass
+class InducedAmplitudeModulation:
+    """Induced amplitude modulation (IAM) — amplitude modulation without an
+    isoabsorptive point.
+
+    The mixture is divided by the *unit-concentration* spectrum of Y (Y′ / C).
+    In the ratio spectrum P(λ) = (aX/aY)(λ)·C_X + C_Y. The plateau where only Y
+    absorbs gives C_Y; at the chosen λ the factor r = aX/aY (from pure X
+    standards) turns the remaining amplitude into C_X:
+    C_X = (P(λ) − C_Y) / r. With λ at an isoabsorptive point r = 1 (classic AM).
+    """
+
+    wavelength: float
+    plateau: tuple[float, float]
+    factor: float = float("nan")
+
+    @staticmethod
+    def unit_divisor(y_standards: list[Spectrum], compound: str) -> Spectrum:
+        """Average unit-concentration spectrum of Y from its standards."""
+        ref = y_standards[0]
+        rows = [np.interp(ref.wavelengths, s.wavelengths, s.values) / s.concentrations[compound]
+                for s in y_standards]
+        return ref.copy(values=np.mean(rows, axis=0), name=f"{compound} (unit)")
+
+    def fit(self, x_standards: list[Spectrum], x_name: str, divisor: Spectrum) -> None:
+        r = []
+        for s in x_standards:
+            ratio = s.values / _on_grid(divisor, s)
+            r.append(float(np.interp(self.wavelength, s.wavelengths, ratio))
+                     / s.concentrations[x_name])
+        self.factor = float(np.mean(r))
+
+    def predict(self, mixture: Spectrum, divisor: Spectrum) -> dict:
+        ratio = mixture.with_values(mixture.values / _on_grid(divisor, mixture))
+        cy = float(np.mean(ratio.region(*self.plateau)[1]))
+        cx = (ratio.value_at(self.wavelength) - cy) / self.factor
+        return {"X": float(cx), "Y": cy}
+
+
+@dataclass
+class AdvancedAbsorbanceSubtraction:
+    """Advanced absorbance subtraction (AAS).
+
+    λ1 and λ2 are chosen where the interferent Y has equal absorbance, so
+    ΔA = A(λ2) − A(λ1) depends on X only (dual wavelength) → C_X from the X
+    calibration of ΔA. The amplitude factor AF = A_X(λ2)/ΔA_X (pure X) gives
+    X's absorbance at λ2 in the mixture; the remainder at λ2 belongs to Y and
+    is read from the Y calibration at λ2."""
+
+    w1: float
+    w2: float
+    amplitude_factor: float = float("nan")
+    x_regression: Regression | None = None
+    y_regression: Regression | None = None
+
+    def fit(self, x_standards: list[Spectrum], x_name: str, y_standards: list[Spectrum],
+            y_name: str) -> None:
+        dx = [s.value_at(self.w2) - s.value_at(self.w1) for s in x_standards]
+        self.x_regression = linear_regression([s.concentrations[x_name] for s in x_standards], dx)
+        self.amplitude_factor = float(np.mean([s.value_at(self.w2) / d
+                                               for s, d in zip(x_standards, dx)]))
+        self.y_regression = linear_regression([s.concentrations[y_name] for s in y_standards],
+                                              [s.value_at(self.w2) for s in y_standards])
+
+    def predict(self, mixture: Spectrum) -> dict:
+        d = mixture.value_at(self.w2) - mixture.value_at(self.w1)
+        cx = float(self.x_regression.predict_x(d))
+        ay = mixture.value_at(self.w2) - self.amplitude_factor * d
+        return {"X": cx, "Y": float(self.y_regression.predict_x(ay))}
+
+
+def equal_amplitude_wavelengths(s: Spectrum, wavelength: float, start: float | None = None,
+                                end: float | None = None) -> list[float]:
+    """Wavelengths where ``s`` has the same value as at ``wavelength`` (for
+    choosing λ pairs in dual wavelength / dual amplitude difference / HPSAM)."""
+    target = s.value_at(wavelength)
+    out = zero_crossings(s.with_values(s.values - target), start, end)
+    return [w for w in out if abs(w - wavelength) > 2 * s.step]
+
+
+# --------------------------------------------------------------------------- #
+# Standard addition and robustness
+# --------------------------------------------------------------------------- #
+def standard_addition_recovery(predict, spectra: list[Spectrum], added: list[float]) -> dict:
+    """Standard addition technique.
+
+    ``predict`` maps a spectrum to a concentration (any calibrated method).
+    Spectra with added = 0 are the unspiked sample; for each spiked spectrum the
+    amount recovered = found − mean(found of unspiked). Also returns the
+    classic extrapolation (x-intercept of found vs added)."""
+    found = np.array([predict(s) for s in spectra], float)
+    added = np.array(added, float)
+    base = found[added == 0]
+    if base.size == 0:
+        raise ValueError("include at least one unspiked sample (added = 0)")
+    b = float(base.mean())
+    rows = []
+    for s, f, a in zip(spectra, found, added):
+        rec = 100 * (f - b) / a if a else None
+        rows.append({"name": s.name, "added": float(a), "found": float(f),
+                     "recovered": float(f - b) if a else None, "recovery": rec})
+    recs = [r["recovery"] for r in rows if r["recovery"] is not None]
+    out = {"sample": b, "rows": rows,
+           "mean_recovery": float(np.mean(recs)) if recs else float("nan"),
+           "sd_recovery": float(np.std(recs, ddof=1)) if len(recs) > 1 else float("nan")}
+    if np.unique(added).size >= 2:
+        reg = linear_regression(added, found)
+        out["extrapolated"] = reg.intercept / reg.slope if reg.slope else float("nan")
+        out["regression"] = reg.to_dict()
+    return out
+
+
+def numeric_parameters(method: UnivariateMethod) -> list[dict]:
+    """Parameters of a method that can be varied in a robustness study."""
+    from spectro.core.operations import REGISTRY
+
+    out = []
+    for i, st in enumerate(method.steps):
+        op = REGISTRY[st["op"]]
+        for p in op.params:
+            v = st.get("params", {}).get(p.name, p.default)
+            if p.kind in ("wavelength", "float", "int") and v is not None:
+                delta = 1.0 if p.kind in ("wavelength", "int") else abs(v) * 0.05 or 0.1
+                out.append({"path": ("steps", i, p.name), "label": f"{op.label}: {p.label}",
+                            "value": v, "delta": delta, "kind": p.kind})
+    for k, v in method.measurement.get("params", {}).items():
+        if k in ("w1", "w2") and v is not None:
+            out.append({"path": ("measurement", k), "label": f"Measurement {k.replace('w', 'λ')}",
+                        "value": v, "delta": 1.0, "kind": "wavelength"})
+    return out
+
+
+def _with(method: UnivariateMethod, path: tuple, value) -> UnivariateMethod:
+    m = UnivariateMethod.from_dict(copy.deepcopy(method.to_dict()))
+    m.regression = None
+    if path[0] == "steps":
+        m.steps[path[1]]["params"][path[2]] = value
+    else:
+        m.measurement["params"][path[1]] = value
+    return m
+
+
+def robustness_study(method: UnivariateMethod, calibration: list[Spectrum],
+                     test: list[Spectrum], variations: list[dict],
+                     resolve: Resolver | None = None,
+                     progress=None) -> dict:
+    """Re-calibrate and re-assay with each parameter moved by ±delta.
+
+    Returns per-variant slope, r and mean recovery / found values, and the
+    %RSD of the results across all variants (robust if small)."""
+    def run(m: UnivariateMethod) -> dict:
+        reg = m.calibrate(calibration, resolve)
+        found = [m.predict(s, resolve) for s in test]
+        rec = [100 * f / s.concentrations[m.compound] for f, s in zip(found, test)
+               if s.concentrations.get(m.compound)]
+        return {"slope": reg.slope, "r": reg.r, "found": found,
+                "mean_found": float(np.mean(found)),
+                "mean_recovery": float(np.mean(rec)) if rec else float("nan"),
+                "rsd_recovery": float(np.std(rec, ddof=1) / np.mean(rec) * 100)
+                if len(rec) > 1 else float("nan")}
+
+    variants = [{"label": "Nominal", "change": "", **run(method)}]
+    total = 2 * len(variations)
+    for k, v in enumerate(variations):
+        for sign in (-1, 1):
+            new = v["value"] + sign * v["delta"]
+            if v["kind"] == "int":
+                new = int(round(new))
+            m = _with(method, tuple(v["path"]), new)
+            try:
+                res = run(m)
+            except Exception as exc:  # reported, not fatal
+                res = {"error": str(exc)}
+            variants.append({"label": v["label"], "change": f"{v['value']:g} → {new:g}", **res})
+            if progress and progress(2 * k + (sign > 0) + 1, total) is False:
+                raise InterruptedError("cancelled")
+    ok = [v for v in variants if "error" not in v]
+    means = [v["mean_found"] for v in ok]
+    nominal = variants[0]["mean_found"]
+    for v in ok:
+        v["deviation"] = 100 * (v["mean_found"] - nominal) / nominal if nominal else float("nan")
+    return {"variants": variants,
+            "rsd_across_variants": float(np.std(means, ddof=1) / np.mean(means) * 100)
+            if len(means) > 1 else float("nan"),
+            "max_abs_deviation": float(max(abs(v["deviation"]) for v in ok))}
