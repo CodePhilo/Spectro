@@ -28,10 +28,14 @@ LAYOUTS = ("auto", "columns", "xy_pairs", "rows")
 # Header words that describe an axis rather than name a sample.
 _GENERIC = {
     "", "wavelength", "wavelength (nm)", "wavelength nm", "wavelength nm.", "nm",
-    "wl", "lambda", "x", "y", "abs", "abs.", "absorbance", "absorbance (au)", "a",
-    "au", "%t", "t", "transmittance", "data", "value", "values", "intensity",
+    "wl", "lambda", "abs", "abs.", "absorbance", "absorbance (au)",
+    "au", "%t", "transmittance", "data", "value", "values", "intensity",
     "wavelength[nm]", "abs[au]", "absorbance[au]", "(nm)", "nm.",
 }
+
+# Single letters are axis labels only when a file holds one spectrum
+# (otherwise "A", "B", "C"… are sample names).
+_AXIS_LETTERS = {"a", "t", "x", "y"}
 
 _NUM_RE = re.compile(r"^[+-]?(\d+([.]\d*)?|[.]\d+)([eE][+-]?\d+)?$")
 
@@ -184,7 +188,9 @@ def _parse_columns(num, text, default_name) -> ParseResult:
         if spectra:
             if len(spectra) == 1:
                 c = next(i for i in range(ncol) if i != xc and np.isfinite(num[a:b, i]).sum() >= 3)
-                spectra[0].name = _name_above(text, a, [c, xc]) or default_name
+                found = _name_above(text, a, [c, xc])
+                spectra[0].name = (found if found and found.lower() not in _AXIS_LETTERS
+                                   else default_name)
             return ParseResult(spectra, "columns")
     raise ValueError("no wavelength column found")
 
