@@ -37,22 +37,40 @@ def split_lines(content: str, delimiter: str) -> list[list[str]]:
     return list(csv.reader(io.StringIO("\n".join(lines)), delimiter=delimiter))
 
 
+def _score(rows: list[list[str]], dc: bool) -> int:
+    score = 0
+    for r in rows:
+        n = sum(1 for c in r if to_float(c, dc) == to_float(c, dc))  # not NaN
+        if n >= 2:
+            score += n
+    return score
+
+
 def detect_format(content: str) -> tuple[str, bool]:
-    """Return ``(delimiter, decimal_comma)`` that best explains the numbers."""
-    sample = "\n".join(content.splitlines()[:400])
+    """Return ``(delimiter, decimal_comma)`` that best explains the numbers.
+
+    An explicit delimiter (tab, ';', '|', ',') present on most numeric lines
+    wins over whitespace splitting, so sample names containing spaces
+    ("V1 PAR 9 CAF 5") stay in one cell.
+    """
+    lines = content.splitlines()[:400]
+    sample = "\n".join(lines)
+    numeric = [ln for ln in lines if sum(ch.isdigit() for ch in ln) >= 2]
     best: tuple[int, str, bool] = (-1, "ws", False)
-    for delim in _DELIMS:
-        rows = split_lines(sample, delim)
-        for dc in (False, True):
-            if dc and delim == ",":
+    for explicit_only in (True, False):
+        for delim in _DELIMS:
+            if explicit_only and (delim == "ws" or not numeric or
+                                  sum(delim in ln for ln in numeric) < 0.8 * len(numeric)):
                 continue
-            score = 0
-            for r in rows:
-                n = sum(1 for c in r if to_float(c, dc) == to_float(c, dc))  # not NaN
-                if n >= 2:
-                    score += n
-            if score > best[0]:
-                best = (score, delim, dc)
+            rows = split_lines(sample, delim)
+            for dc in (False, True):
+                if dc and delim == ",":
+                    continue
+                score = _score(rows, dc)
+                if score > best[0]:
+                    best = (score, delim, dc)
+        if best[0] > 0:
+            break
     _, delim, dc = best
     # Decimal comma only if comma-decimals actually occur.
     if dc and not _DECIMAL_COMMA_RE.search(sample):

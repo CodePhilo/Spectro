@@ -33,6 +33,29 @@ Python 3.10+ is required. To build a standalone Windows program
 workflow `.github/workflows/windows.yml` runs the tests, builds the `.exe`
 and uploads it as the `Spectro-windows` artifact on every push.
 
+## Demo data
+
+**Help → Open demo project…** builds a complete project in about a second:
+
+- **Binary trial (Panadol Extra):** paracetamol and caffeine standards
+  (2–20 µg/mL), 8 laboratory mixtures, 3 tablet solutions and a solvent blank.
+  It includes ratio and D1 spectra, ratio difference methods for both drugs and
+  Vierordt equations.
+- **Ternary trial (Excedrin):** a 25-mixture Brereton training set, 5
+  validation mixtures and 3 tablet solutions, with a cross-validated PLS2
+  model.
+
+Recoveries are 98.6–102 % with RSD ≈ 0.5–1 %. The project's audit trail shows
+every step used to build it. **Help → Copy demo data files…** copies the
+underlying files so you can try the import dialog on seven different
+instrument-export styles (see [`spectro/demo_data/README.md`](spectro/demo_data/README.md)).
+The same project can be built from the command line with
+`python -m spectro.demo "Spectro demo.spectro"`.
+
+> The demo spectra are **simulated** from published band positions and
+> absorptivities, with realistic noise, baseline and preparation errors. They
+> are not measured data. Regenerate them with `python tools/make_demo_data.py`.
+
 ## Typical workflow
 
 1. **File → New project…** creates one `.spectro` file (a SQLite database) that

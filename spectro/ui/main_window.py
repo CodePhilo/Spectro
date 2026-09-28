@@ -115,7 +115,8 @@ class MainWindow(QMainWindow):
         adock.setWidget(self.audit_table)
         self.addDockWidget(Qt.BottomDockWidgetArea, adock)
         self.docks = [dock, pdock, adock]
-        self.statusBar().showMessage("Create or open a project to start.")
+        self.statusBar().showMessage(
+            "Create or open a project to start — or try Help → Open demo project.")
 
     def _build_menus(self) -> None:
         mb = self.menuBar()
@@ -186,6 +187,11 @@ class MainWindow(QMainWindow):
             m.addAction(d.toggleViewAction())
 
         m = mb.addMenu("&Help")
+        act(m, "Open &demo project…", self.open_demo, needs_project=False,
+            tip="Paracetamol / caffeine / aspirin demo with methods and results")
+        act(m, "&Copy demo data files…", self.copy_demo, needs_project=False,
+            tip="Instrument-style files for trying File → Import spectra")
+        m.addSeparator()
         act(m, "&About", self.about, needs_project=False)
 
     def _update_enabled(self) -> None:
@@ -576,6 +582,65 @@ class MainWindow(QMainWindow):
                                     "data hashes.")
         else:
             QMessageBox.critical(self, "Integrity check FAILED", "\n".join(rep["problems"][:30]))
+
+    def open_demo(self):
+        from spectro.demo import build_demo_project
+
+        default = Path.home() / "Documents" / "Spectro demo.spectro"
+        if not default.parent.exists():
+            default = Path.home() / "Spectro demo.spectro"
+        path, _ = QFileDialog.getSaveFileName(self, "Create demo project", str(default),
+                                              "Spectro project (*.spectro)")
+        if not path:
+            return
+        if not path.endswith(".spectro"):
+            path += ".spectro"
+        if Path(path).exists():
+            if QMessageBox.question(self, "Demo project",
+                                    f"{Path(path).name} already exists. Open it?") \
+                    == QMessageBox.Yes:
+                self._open(path)
+            return
+        self.close_project()
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            proj = build_demo_project(path, lambda msg: (self.statusBar().showMessage(msg),
+                                                         QApplication.processEvents()))
+        except Exception as exc:
+            QApplication.restoreOverrideCursor()
+            error(self, exc)
+            return
+        QApplication.restoreOverrideCursor()
+        self._attach(proj)
+        QMessageBox.information(
+            self, "Demo project",
+            "Demo project created.\n\n"
+            "• Two trials: binary paracetamol + caffeine (Panadol Extra) and ternary "
+            "aspirin + paracetamol + caffeine (Excedrin).\n"
+            "• Select spectra in the tree to plot them; derived spectra (ratio, D1) are "
+            "nested under their parents.\n"
+            "• Methods → Saved methods & results shows the ratio difference, Vierordt and "
+            "PLS2 methods and their recoveries.\n"
+            "• Audit → Audit trail shows every step used to build this project.\n\n"
+            "The spectra are simulated from published absorptivities with realistic "
+            "noise and errors — not measured data.")
+
+    def copy_demo(self):
+        from spectro.demo import copy_demo_files
+
+        folder = QFileDialog.getExistingDirectory(self, "Copy demo data files to…",
+                                                  str(Path.home()))
+        if not folder:
+            return
+        try:
+            target = copy_demo_files(folder)
+        except Exception as exc:
+            error(self, exc)
+            return
+        QMessageBox.information(self, "Demo data",
+                                f"Copied to:\n{target}\n\nUse File → Import spectra… to try "
+                                "each instrument format (Shimadzu-style TXT, Cary-style CSV, "
+                                "Excel, European CSV, JCAMP-DX, row-wise TSV, GRAMS SPC).")
 
     def about(self):
         QMessageBox.about(self, "About Spectro",

@@ -22,5 +22,8 @@ spectro = "spectro.ui.main_window:main"
 [tool.setuptools.packages.find]
 include = ["spectro*"]
 
+[tool.setuptools.package-data]
+spectro = ["demo_data/**/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

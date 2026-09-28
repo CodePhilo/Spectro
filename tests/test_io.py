@@ -105,3 +105,11 @@ def test_jcamp_compressed_forms():
     s = parse_jcamp(text).spectra[0]
     assert np.allclose(s.x, np.arange(200, 208))
     assert np.allclose(s.y, [0, 0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07])
+
+
+def test_tab_delimited_rows_with_spaces_in_names(tmp_path):
+    f = tmp_path / "v.tsv"
+    f.write_text("Sample\t" + "\t".join(map(str, X)) + "\nV1 PAR 9 CAF 5\t"
+                 + "\t".join(["0.3"] * X.size))
+    r = load_file(f)
+    assert r.spectra[0].name == "V1 PAR 9 CAF 5" and r.spectra[0].x.size == X.size

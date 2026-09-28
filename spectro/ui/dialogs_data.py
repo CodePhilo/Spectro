@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDialog,
 
 from spectro.core.io import (IMPORT_FILTER, ParseOptions, export_csv, export_excel, load_file,
                              write_jcamp, write_spc)
+from spectro.core.naming import concentrations_from_name
 from spectro.core.operations import apply_pipeline
 from spectro.storage.project import ROLES
 from spectro.ui.widgets import (PasteTable, PipelineEditor, SpectrumPlot, ask_reason, error,
@@ -188,21 +189,11 @@ class ImportDialog(Base):
         if not self.compounds:
             error(self, "Define compounds first (Edit → Compounds…).")
             return
-        num = r"(\d+(?:[.,]\d+)?)"
         for k in range(self.table.rowCount()):
-            name = self.table.item(k, 2).text()
-            found = {}
-            for c in self.compounds:
-                m = re.search(re.escape(c) + r"\s*[_\-:= ]?\s*" + num, name, re.I)
-                if m:
-                    found[c] = m.group(1)
-            if not found:
-                nums = re.findall(num, name)
-                if len(nums) >= len(self.compounds):
-                    found = dict(zip(self.compounds, nums))
+            found = concentrations_from_name(self.table.item(k, 2).text(), self.compounds)
             for j, c in enumerate(self.compounds):
                 if c in found:
-                    self.table.item(k, 5 + j).setText(found[c].replace(",", "."))
+                    self.table.item(k, 5 + j).setText(f"{found[c]:g}")
 
     def _import(self):
         if not self.results:

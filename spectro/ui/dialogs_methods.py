@@ -1106,8 +1106,34 @@ class SavedDialog(Base):
 
     def _show_result(self):
         r = self.rtable.currentRow()
-        if 0 <= r < len(self.res):
-            self.detail.setPlainText(json.dumps(self.res[r]["data"], indent=2, ensure_ascii=False))
+        if not 0 <= r < len(self.res):
+            return
+        data = self.res[r]["data"]
+        ids, found, comps = data.get("ids"), data.get("found"), data.get("compounds")
+        if not (ids and comps and isinstance(found, list) and found
+                and isinstance(found[0], list)):
+            self.out.setRowCount(0)
+            self.detail.setPlainText(json.dumps(data, indent=2, ensure_ascii=False))
+            return
+        rows, recs = [], {c: [] for c in comps}
+        for sid, f in zip(ids, found):
+            try:
+                rec = self.project.record(int(sid))
+            except KeyError:
+                continue
+            row = [rec.name]
+            for c, v in zip(comps, f):
+                t = rec.concentrations.get(c)
+                rv = 100 * v / t if t else None
+                if rv is not None:
+                    recs[c].append(rv)
+                row += [float(v), "" if t is None else float(t), "" if rv is None else rv]
+            rows.append(row)
+        fill_table(self.out, ["Spectrum"] + [h for c in comps for h in
+                                             (f"{c} found", f"{c} taken", f"{c} rec %")], rows)
+        lines = [f"{self.res[r]['name']}  ({self.res[r]['kind']}, {len(rows)} spectra)"]
+        lines += [f"{c}: " + summary_text(v) for c, v in recs.items() if len(v) > 1]
+        self.detail.setPlainText("\n".join(lines))
 
     def _archive(self):
         from spectro.ui.widgets import ask_reason
