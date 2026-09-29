@@ -11,12 +11,13 @@ def run() -> str:
     import xlrd
 
     from spectro.demo import data_dir
-    from spectro.ui import dialogs_data, dialogs_methods, dialogs_tools, figure, report
+    from spectro.ui import (dialog_optimizer, dialogs_data, dialogs_methods, dialogs_tools,
+                            figure, report)
 
     if not (data_dir() / "ternary" / "excedrin_tablets.spc").exists():
         raise RuntimeError("demo data missing from the build")
 
     modules = (matplotlib.backends.backend_agg, olefile, openpyxl, sklearn.cross_decomposition, sklearn.neural_network,
-               sklearn.svm, xlrd, dialogs_data, dialogs_methods, dialogs_tools, figure,
+               sklearn.svm, xlrd, dialog_optimizer, dialogs_data, dialogs_methods, dialogs_tools, figure,
                report)
     return f"selfcheck ok ({len(modules)} modules)"

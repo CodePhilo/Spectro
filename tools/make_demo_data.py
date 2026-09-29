@@ -25,6 +25,7 @@ ternary/ (Excedrin: aspirin 250 mg + paracetamol 250 mg + caffeine 65 mg)
   training_set_brereton.jdx   25 JCAMP-DX blocks (5-level multifactor design)
   validation_mixtures.tsv     one spectrum per row (λ in first row)
   excedrin_tablets.spc        GRAMS SPC multi-file
+  ASA_standards.csv           aspirin standards 4–20 µg/mL (λ + one column each)
 
 Run:  python tools/make_demo_data.py
 """
@@ -157,6 +158,12 @@ def main() -> None:
     exc = [Spectrum(wl1, measure({"ASA": 12 * f, "PAR": 12 * f, "CAF": 3.12 * f}, wl1),
                     name=f"Excedrin tablet {i + 1}") for i, f in enumerate([1.004, 0.995, 1.001])]
     write_spc(exc, ternary / "excedrin_tablets.spc")
+
+    # Aspirin standards (generated last so the files above stay unchanged)
+    asa = [(f"ASA {c}", wl1, measure({"ASA": c}, wl1)) for c in (4, 8, 12, 16, 20)]
+    lines = ["Wavelength (nm)," + ",".join(n for n, _, _ in asa)]
+    lines += [f"{w:g}," + ",".join(f"{y[i]:.4f}" for _, _, y in asa) for i, w in enumerate(wl1)]
+    (ternary / "ASA_standards.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"demo data written to {OUT}")
 
 

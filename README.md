@@ -56,6 +56,17 @@ The same project can be built from the command line with
 > absorptivities, with realistic noise, baseline and preparation errors. They
 > are not measured data. Regenerate them with `python tools/make_demo_data.py`.
 
+## Workflow gallery
+
+[`docs/workflows/`](docs/workflows/README.md) shows 23 annotated screenshots of
+the main workflows on the demo project, each with the benefit it brings. To
+regenerate them (for example after changing the UI), run:
+
+```bash
+python tools/workflow_screenshots.py            # → docs/workflows/ (index.html + README.md)
+python tools/workflow_screenshots.py --out shots --only optimizer,univariate
+```
+
 ## Typical workflow
 
 1. **File → New project…** creates one `.spectro` file (a SQLite database) that
@@ -84,6 +95,7 @@ The same project can be built from the command line with
 | Derivative | D1–D4 (finite difference Δλ or Savitzky–Golay, scaling factor); zero-crossing; peak-to-peak; dual wavelength in derivative mode; factorized zero-order |
 | Ratio spectra | derivative ratio (DD1); ratio difference; mean centering of ratio spectra; successive derivative ratio, double divisor (sum divisor) and dual amplitude difference (ternary); ratio subtraction and extended ratio subtraction; successive spectrum subtraction (ternary); constant multiplication; constant center; spectrum subtraction; plateau/constant value |
 | Chemometrics | CLS, ILS/MLR, PCR, PLS-1, PLS-2, MCR-ALS (non-negativity + correlation constraint), ANN (MLP on PCA scores), SVR; LOO / venetian / k-fold / contiguous cross-validation with Haaland–Thomas selection of components; iPLS and GA interval selection; VIP; Hotelling T² vs Q with 95/99 % limits, outlier flags and one-click exclusion; fitted models saved in the project and exportable as `.spmodel` files (with embedded divisor spectra and checksums); progress bars with cancel for CV, iPLS, GA and fitting; Brereton 5-level multifactor calibration design |
+| Method optimizer | *Tools → Method optimizer*: from the pure standards it predicts, for every compound, the interference, noise and ±λ-robustness of every processing strategy (zero order, derivative zero-crossing, dual / induced dual wavelength, ratio difference, derivative ratio, mean centering, ratio subtraction / constant multiplication, dual amplitude difference, double divisor, Vierordt, bivariate, CLS, PLS) over all wavelengths and λ pairs; the best settings of each are verified end-to-end on simulated and laboratory mixtures and ranked; any row can be saved as a ready, calibrated method |
 | Finder tools | zero-crossing points, isoabsorptive points, maxima/minima, ratio-spectrum plateaus, equal-amplitude λ pairs |
 | Method studies | standard addition inside univariate methods (recovery of each spike + extrapolation); robustness study (each parameter ± Δ, re-calibrated and re-assayed, % deviation) |
 | Output | results to Excel (one sheet per result + index + methods), any table to Excel (right-click), publication figures from any plot (right-click / *Export figure*: size in mm, 300–1200 dpi TIFF/PNG or vector SVG/PDF/EPS, fonts, black-and-white mode); plot views: overlay, stacked, difference, normalized |

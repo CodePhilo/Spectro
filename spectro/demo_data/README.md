@@ -20,6 +20,7 @@ can be tried on all of them:
 | `ternary/training_set_brereton.jdx` | JCAMP-DX, 25 blocks | 5-level multifactor design (PAR 6–14, CAF 3–9, ASA 6–18 µg/mL) |
 | `ternary/validation_mixtures.tsv` | one spectrum per row | 5 validation mixtures |
 | `ternary/excedrin_tablets.spc` | GRAMS SPC multi-file | 3 tablet solutions (12 ASA + 12 PAR + 3.12 CAF µg/mL nominal) |
+| `ternary/ASA_standards.csv` | comma CSV, λ + one column per standard | aspirin standards 4–20 µg/mL |
 
 Concentrations are in the sample names ("PAR 8 CAF 4"), so *Fill
 concentrations from names* in the import dialog fills them in automatically.

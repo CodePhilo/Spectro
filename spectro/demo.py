@@ -132,6 +132,7 @@ def build_demo_project(path: str | Path,
     exc = _import(p, "ternary/excedrin_tablets.spc", tt, "sample", comps,
                   fixed={"PAR": 12.0, "CAF": 3.12, "ASA": 12.0},
                   names=[f"Excedrin tablet {i} (label claim)" for i in (1, 2, 3)])
+    _import(p, "ternary/ASA_standards.csv", tt, "standard", comps)
 
     say("Building PLS model…")
     pls = SpectralModel("PLS2", comps, ranges=[(215.0, 310.0)], n_components=3)

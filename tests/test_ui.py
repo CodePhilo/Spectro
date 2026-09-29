@@ -290,3 +290,43 @@ def test_default_selection_excludes_derived(win):
     cal, test = checklists(p, "X")
     assert not set(cal.checked_ids()) & set(derived)
     assert set(cal.checked_ids()) <= set(std)
+
+
+def test_method_optimizer_dialog(win):
+    from spectro.ui.dialog_optimizer import OptimizerDialog
+    d = OptimizerDialog(win)
+    for i in range(d.comps.count()):  # X + Y only
+        d.comps.item(i).setCheckState(Qt.Checked if d.comps.item(i).text() in ("X", "Y")
+                                      else Qt.Unchecked)
+    assert all(len(d.std_ids[c]) == 5 for c in ("X", "Y"))
+    d._run()
+    assert d.result and d.table.rowCount() > 5
+    assert "Recommendations" in d.summary.text()
+    best = d.cands[0]
+    assert best.score < 3
+    d.table.selectRow(0)
+    d._explain()
+    n = len(win.project.methods())
+    d._save()
+    assert len(win.project.methods()) == n + 1
+    uni = next(i for i, c in enumerate(d.cands) if c.measurement)
+    d.table.selectRow(uni)
+    d._save()
+    saved = win.project.methods()[-1]["definition"]
+    assert saved["type"] == "univariate" and saved["regression"]["r"] > 0.999
+
+
+def test_optimizer_ignores_mixtures_with_unselected_compounds(win):
+    from spectro.core.spectrum import Spectrum
+    from spectro.ui.dialog_optimizer import OptimizerDialog
+    p = win.project
+    tern = mixture({"X": 6, "Y": 8, "Z": 5}, "ternary mix")
+    tid = p.trials()[0]["id"]
+    sid = p.add_spectrum(Spectrum(tern.x, tern.y, name="ternary mix",
+                                  concentrations=tern.concentrations), tid, role="mixture")
+    d = OptimizerDialog(win)
+    for i in range(d.comps.count()):
+        d.comps.item(i).setCheckState(Qt.Checked if d.comps.item(i).text() in ("X", "Y")
+                                      else Qt.Unchecked)
+    ids = [d.mix.item(i).data(Qt.UserRole) for i in range(d.mix.count())]
+    assert sid not in ids and ids

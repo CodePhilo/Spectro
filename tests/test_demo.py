@@ -4,7 +4,7 @@ from spectro.demo import build_demo_project, data_dir
 
 def test_every_demo_file_imports():
     files = [f for f in data_dir().rglob("*") if f.is_file() and f.suffix != ".md"]
-    assert len(files) == 15
+    assert len(files) == 16
     for f in files:
         r = load_file(f)
         assert r.spectra and all(s.x[0] == 200 and s.x[-1] == 400 for s in r.spectra), f.name

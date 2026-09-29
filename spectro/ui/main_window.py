@@ -205,6 +205,8 @@ class MainWindow(QMainWindow):
         act(m, "Saved methods && results…", self.saved)
 
         m = mb.addMenu("&Tools")
+        act(m, "&Method optimizer (find the best processing)…", self.optimizer, "Ctrl+Shift+O",
+            tip="Rank processing strategies for simultaneous determination")
         act(m, "&Spectral finder (zero-crossing, isoabsorptive, extrema, plateau)…",
             self.finder, "Ctrl+F")
         act(m, "&Validation statistics (ICH Q2)…", self.validation, needs_project=False)
@@ -542,10 +544,10 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------ dialogs
     def _dialog(self, module: str, cls: str, *args):
-        from spectro.ui import dialogs_data, dialogs_methods, dialogs_tools
+        from spectro.ui import dialog_optimizer, dialogs_data, dialogs_methods, dialogs_tools
 
         mod = {"dialogs_data": dialogs_data, "dialogs_methods": dialogs_methods,
-               "dialogs_tools": dialogs_tools}[module]
+               "dialogs_tools": dialogs_tools, "dialog_optimizer": dialog_optimizer}[module]
         dlg = getattr(mod, cls)(self, *args)
         dlg.exec()
         return dlg
@@ -592,6 +594,9 @@ class MainWindow(QMainWindow):
 
     def saved(self):
         self._dialog("dialogs_methods", "SavedDialog")
+
+    def optimizer(self):
+        self._dialog("dialog_optimizer", "OptimizerDialog")
 
     def finder(self):
         self._dialog("dialogs_tools", "FinderDialog")

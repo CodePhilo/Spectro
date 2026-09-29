@@ -375,7 +375,7 @@ Please tick what you accept, strike what you reject, and add comments.
 
 ---
 
-## 13. Implementation status (v0.2)
+## 13. Implementation status (v0.3)
 
 | Milestone | Status | Notes |
 |---|---|---|
@@ -384,6 +384,7 @@ Please tick what you accept, strike what you reject, and add comments.
 | M2 Pre‑processing & pipelines | ✅ | 29 registered operations with auto‑generated forms, live preview, derived spectra with lineage, "recompute from raw" verification |
 | M3 Univariate methods | ✅ | Generic pipeline + measurement + calibration (22 templates incl. dual amplitude difference, extended ratio subtraction, successive spectrum subtraction, double divisor), equation methods (Vierordt, multi‑λ LS, bivariate + Kaiser, AUC), Q‑analysis, absorbance subtraction, advanced absorbance subtraction, amplitude modulation, induced amplitude modulation, HPSAM, finder tools; standard addition and robustness studies |
 | M4 Validation & reports | ✅ | ICH Q2 statistics; PDF/HTML trial report with audit trail; Excel export of results and tables; publication figures (matplotlib); stacked / difference / normalized views |
+| Method optimizer | ✅ | Linear-signal screening of 14 strategy families over all λ / λ pairs (interference, noise incl. baseline offsets, ±λ uncertainty) + end-to-end verification on simulated and laboratory mixtures; ranked; save as calibrated method |
 | M5 Chemometrics | ✅ | CLS, ILS, PCR, PLS1/2, MCR‑ALS, ANN, SVR, CV, iPLS, GA, VIP, Brereton design; T² / Q limits (F, Box χ²), outlier flags and exclusion; frozen fitted models, `.spmodel` export/import; background work with progress/cancel |
 | M7 Packaging | ✅ (CI) | PyInstaller build verified on Linux; Windows `.exe` built by GitHub Actions |
 | Formal CSV documentation | ⏳ | Deferred per review |
