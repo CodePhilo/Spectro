@@ -95,7 +95,19 @@ def savgol_derivative(s: Spectrum, order: int, window: int, polyorder: int) -> n
         raise ValueError("window must be larger than the polynomial order")
     if polyorder < order:
         raise ValueError("polynomial order must be ≥ derivative order")
-    return savgol_filter(s.values, window, polyorder, deriv=order, delta=s.step)
+    if window > s.values.size:
+        raise ValueError(f"window ({window} points) is longer than the spectrum "
+                         f"({s.values.size} points)")
+    x = s.wavelengths
+    d = np.diff(x)
+    if np.ptp(d) <= 1e-6 * np.median(d):
+        return savgol_filter(s.values, window, polyorder, deriv=order, delta=float(np.median(d)))
+    # Savitzky–Golay assumes equal spacing: work on a regular grid at the finest
+    # step, then return to the original wavelengths.
+    step = float(np.min(d))
+    reg = np.arange(x[0], x[-1] + step / 2, step)
+    y = savgol_filter(np.interp(reg, x, s.values), window, polyorder, deriv=order, delta=step)
+    return np.interp(x, reg, y)
 
 
 def difference_derivative(s: Spectrum, order: int, delta_lambda: float) -> np.ndarray:
@@ -134,7 +146,12 @@ def op_resample(s: Spectrum, step: float, start: float | None = None,
     """Linear interpolation onto a regular grid."""
     lo = s.wavelengths[0] if start is None else max(start, s.wavelengths[0])
     hi = s.wavelengths[-1] if end is None else min(end, s.wavelengths[-1])
+    if step <= 0:
+        raise ValueError("the resampling interval must be positive")
     n = int(np.floor((hi - lo) / step + 1e-9)) + 1
+    if hi <= lo or n < 2:
+        raise ValueError(f"resampling range {lo:g}–{hi:g} nm with interval {step:g} nm "
+                         "gives fewer than two points")
     return s.resampled(lo + step * np.arange(n))
 
 
@@ -185,6 +202,8 @@ def op_baseline_offset(s, start: float, end: float):
           [_wl("w1", "Wavelength 1 (nm)", 220.0), _wl("w2", "Wavelength 2 (nm)", 380.0)])
 def op_baseline_linear(s, w1: float, w2: float):
     """Subtract a straight line through two baseline points."""
+    if abs(w2 - w1) < 1e-9:
+        raise ValueError("choose two different baseline wavelengths")
     a1, a2 = s.value_at(w1), s.value_at(w2)
     return s.values - (a1 + (a2 - a1) * (s.wavelengths - w1) / (w2 - w1))
 
@@ -326,6 +345,8 @@ def op_normalize(s, mode: str, wavelength: float | None = None):
             raise ValueError("choose a wavelength")
         d = s.value_at(wavelength)
     elif mode == "range":
+        if np.ptp(y) == 0:
+            raise ValueError("cannot normalize a constant spectrum")
         return (y - y.min()) / np.ptp(y)
     else:
         raise ValueError(f"unknown mode {mode}")
@@ -337,7 +358,10 @@ def op_normalize(s, mode: str, wavelength: float | None = None):
 @register("snv", "Standard normal variate (SNV)", "Normalization")
 def op_snv(s):
     """(A − mean) / SD for each spectrum."""
-    return (s.values - s.values.mean()) / s.values.std(ddof=1)
+    sd = s.values.std(ddof=1)
+    if sd == 0:
+        raise ValueError("SNV: the spectrum is constant (zero standard deviation)")
+    return (s.values - s.values.mean()) / sd
 
 
 @register("t_to_a", "Transmittance → absorbance", "Normalization",
@@ -366,15 +390,24 @@ def op_a_to_t(s, percent: bool = True):
            Param("window", "Window (points) [S-G]", "int", 11, minimum=3),
            Param("polyorder", "Polynomial order [S-G]", "int", 3, minimum=1),
            Param("scaling", "Scaling factor", "float", 1.0,
-                 help="Multiply the result (instrument 'scaling factor').")])
+                 help="Multiply the result (instrument 'scaling factor').")],
+          changes_grid=True)
 def op_derivative(s, order: int, method: str = "difference", delta_lambda: float = 4.0,
                   window: int = 11, polyorder: int = 3, scaling: float = 1.0):
     """n-th derivative dⁿA/dλⁿ by finite differences (Δλ) or Savitzky–Golay."""
     if method == "savitzky_golay":
         d = savgol_derivative(s, int(order), int(window), max(int(polyorder), int(order)))
-    else:
-        d = difference_derivative(s, int(order), delta_lambda)
-    return d * scaling
+        return s.with_values(d * scaling)
+    # a Δλ difference cannot be computed within order·Δλ/2 of the range ends:
+    # return only the computable part instead of fabricating edge values
+    d = difference_derivative(s, int(order), delta_lambda)
+    half = int(order) * float(delta_lambda) / 2
+    keep = (s.wavelengths >= s.wavelengths[0] + half - 1e-9) & \
+           (s.wavelengths <= s.wavelengths[-1] - half + 1e-9)
+    if keep.sum() < 2:
+        raise ValueError(f"the spectrum is too short for a D{order} derivative with "
+                         f"Δλ = {delta_lambda:g} nm")
+    return s.copy(wavelengths=s.wavelengths[keep], values=d[keep] * scaling)
 
 
 # --------------------------------------------------------------------------- #
@@ -423,7 +456,7 @@ def op_extended_ratio_subtraction(s, divisor: Spectrum, reference: Spectrum, sta
 def _transform(s: Spectrum, derivative_order: int, delta_lambda: float) -> Spectrum:
     if derivative_order <= 0:
         return s
-    return s.with_values(difference_derivative(s, derivative_order, delta_lambda))
+    return op_derivative(s, derivative_order, "difference", delta_lambda)
 
 
 _FACTOR_PARAMS = [
@@ -507,9 +540,11 @@ def apply_step(s: Spectrum, step: dict, resolve: Resolver | None = None) -> Spec
             val = bool(val)
         kwargs[p.name] = val
     out = op.func(s, **kwargs)
-    if isinstance(out, Spectrum):
-        return out
-    return s.with_values(np.asarray(out, dtype=float))
+    out = out if isinstance(out, Spectrum) else s.with_values(np.asarray(out, dtype=float))
+    if not np.all(np.isfinite(out.values)):
+        raise ValueError(f"{op.label} produced invalid values (NaN/∞) — check its parameters "
+                         "(e.g. a wavelength too close to the range end, or division by zero)")
+    return out
 
 
 def apply_pipeline(s: Spectrum, steps: list[dict], resolve: Resolver | None = None) -> Spectrum:

@@ -83,6 +83,8 @@ class FinderDialog(Base):
         self._show()
 
     def _spectra(self):
+        if self.a.currentData() is None:
+            raise ValueError("the project has no spectra yet")
         return self.project.spectrum(self.a.currentData()), self.project.spectrum(self.b.currentData())
 
     def _show(self, marks: list[float] | None = None):
@@ -102,12 +104,20 @@ class FinderDialog(Base):
                           "range": [self.lo.value(), self.hi.value()], "found": rows})
 
     def _zero(self):
-        a, _ = self._spectra()
+        try:
+            a, _ = self._spectra()
+        except ValueError as exc:
+            error(self, exc)
+            return
         zc = uv.zero_crossings(a, self.lo.value(), self.hi.value())
         self._report("zero-crossings", ["λ (nm)"], [[z] for z in zc], zc)
 
     def _iso(self):
-        a, b = self._spectra()
+        try:
+            a, b = self._spectra()
+        except ValueError as exc:
+            error(self, exc)
+            return
         ca = sum(a.concentrations.values()) if self.norm.isChecked() else 1.0
         cb = sum(b.concentrations.values()) if self.norm.isChecked() else 1.0
         if not ca or not cb:
@@ -119,7 +129,11 @@ class FinderDialog(Base):
                      [[p, a.value_at(p), b.value_at(p)] for p in pts], pts)
 
     def _extrema(self):
-        a, _ = self._spectra()
+        try:
+            a, _ = self._spectra()
+        except ValueError as exc:
+            error(self, exc)
+            return
         x, y = a.region(self.lo.value(), self.hi.value())
         sub = a.copy(wavelengths=x, values=y)
         e = uv.extrema(sub, self.prom.value() or None)
@@ -128,7 +142,11 @@ class FinderDialog(Base):
         self._report("extrema", ["Type", "λ (nm)", "Value"], rows, [r[1] for r in rows])
 
     def _equal(self):
-        a, _ = self._spectra()
+        try:
+            a, _ = self._spectra()
+        except ValueError as exc:
+            error(self, exc)
+            return
         ref = self.lo.value()
         try:
             pts = uv.equal_amplitude_wavelengths(a, ref)
@@ -139,7 +157,11 @@ class FinderDialog(Base):
                      [[p, a.value_at(p)] for p in pts], [ref] + pts)
 
     def _plateau(self):
-        a, _ = self._spectra()
+        try:
+            a, _ = self._spectra()
+        except ValueError as exc:
+            error(self, exc)
+            return
         x, y = a.region(self.lo.value(), self.hi.value())
         sub = a.copy(wavelengths=x, values=y)
         pl = uv.find_plateaus(sub, self.width.value(), self.tol.value() / 100)

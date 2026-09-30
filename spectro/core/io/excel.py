@@ -37,11 +37,11 @@ def load_excel(path: str | Path, options: ParseOptions | None = None,
         raise ValueError(f"sheet {sheet!r} not found")
     combined: ParseResult | None = None
     problems: list[str] = []
-    multi = len(sheets) > 1
+    sheets = [(n, [r for r in rows if r is not None]) for n, rows in sheets]
+    sheets = [(n, rows) for n, rows in sheets
+              if any(c not in (None, "") for r in rows for c in r)]
+    multi = len(sheets) > 1  # only sheets that hold data count
     for name, rows in sheets:
-        rows = [r for r in rows if r is not None]
-        if not any(c not in (None, "") for r in rows for c in r):
-            continue
         try:
             res = parse_grid(rows, options, default_name=name if multi else path.stem)
         except ValueError as exc:

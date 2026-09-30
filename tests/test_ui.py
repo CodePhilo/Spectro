@@ -165,8 +165,8 @@ def test_view_modes_and_figure_export(win, tmp_path, monkeypatch):
         fig.savefig(tmp_path / f"f.{ext}", dpi=300)
         assert (tmp_path / f"f.{ext}").stat().st_size > 1000
     from PIL import Image
-    im = Image.open(tmp_path / "f.tif")
-    assert abs(im.size[0] - round(85 / 25.4 * 300)) <= 2
+    with Image.open(tmp_path / "f.tif") as im:
+        assert abs(im.size[0] - round(85 / 25.4 * 300)) <= 2
 
 
 def test_table_export_and_results_excel(win, tmp_path, monkeypatch):

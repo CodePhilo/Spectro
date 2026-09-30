@@ -102,10 +102,12 @@ def _is_axis_like(v: np.ndarray) -> bool:
     if v.size < 3 or not np.all(np.isfinite(v)):
         return False
     d = np.diff(v)
-    if not (np.all(d > 0) or np.all(d < 0)):
+    # monotonic; an occasional repeated point (overlap at a lamp/grating
+    # change) is allowed and averaged later by Spectrum
+    if not ((np.all(d >= 0) or np.all(d <= 0)) and np.mean(d == 0) <= 0.05):
         return False
-    ad = np.abs(d)
-    regular = np.median(ad) > 0 and (np.max(ad) / np.median(ad) < 5.0)
+    ad = np.abs(d[d != 0])
+    regular = ad.size > 0 and np.median(ad) > 0 and (np.max(ad) / np.median(ad) < 5.0)
     return bool(regular and np.min(np.abs(v)) >= 50.0)
 
 

@@ -108,9 +108,15 @@ ternary mixtures with known concentrations.
 ## Development
 
 ```bash
-python -m pip install -r requirements.txt pytest
+python -m pip install -r requirements.txt pytest hypothesis
 QT_QPA_PLATFORM=offscreen python -m pytest -q
 ```
+
+The suite checks every calculation against independent references (SciPy,
+scikit-learn, closed-form results), runs property-based and fuzz tests,
+malformed-input, data-integrity and end-to-end tests, and opens every dialog on
+empty projects. See [`docs/TESTING.md`](docs/TESTING.md), which also lists the
+problems these tests found and how each was fixed.
 
 Layout: `spectro/core` (algorithms and file formats, no UI),
 `spectro/storage` (project database and audit trail), `spectro/ui` (PySide6

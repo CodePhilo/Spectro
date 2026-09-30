@@ -237,24 +237,34 @@ class SpectralModel:
             ysd = Y.std(0, ddof=1)
             ysd[ysd == 0] = 1
             hidden = tuple(int(h) for h in str(self.options.get("hidden", "10")).split(",") if h.strip())
-            net = MLPRegressor(hidden_layer_sizes=hidden or (10,),
-                               activation=self.options.get("activation", "tanh"),
-                               solver="lbfgs", max_iter=int(self.options.get("max_iter", 5000)),
-                               alpha=float(self.options.get("alpha", 1e-4)),
-                               random_state=int(self.options.get("seed", 0)))
-            net.fit(T / ts, (Y - ym) / ysd)
-            self.state.update(P=P, ts=ts, ysd=ysd, net=net)
+            # an ensemble of networks from different random starts is averaged:
+            # a single network lands in slightly different minima depending on
+            # sample order / rounding, the average is stable and more accurate
+            nets = []
+            for e in range(max(1, int(self.options.get("ensemble", 5)))):
+                net = MLPRegressor(hidden_layer_sizes=hidden or (10,),
+                                   activation=self.options.get("activation", "tanh"),
+                                   solver="lbfgs",
+                                   max_iter=int(self.options.get("max_iter", 5000)),
+                                   alpha=float(self.options.get("alpha", 1e-4)), tol=1e-9,
+                                   random_state=int(self.options.get("seed", 0)) + e)
+                nets.append(net.fit(T / ts, (Y - ym) / ysd))
+            self.state.update(P=P, ts=ts, ysd=ysd, net=nets[0], nets=nets)
         elif t == "SVR":
             from sklearn.svm import SVR
 
+            # targets are standardised so that C and ε do not depend on the
+            # concentration unit (ε is a fraction of each compound's SD)
+            ysd = Y.std(0, ddof=1)
+            ysd[ysd == 0] = 1
             models = []
             for j in range(Y.shape[1]):
                 m = SVR(kernel=self.options.get("kernel", "linear"),
                         C=float(self.options.get("C", 100.0)),
                         epsilon=float(self.options.get("epsilon", 0.01)),
-                        gamma=self.options.get("gamma", "scale"))
-                models.append(m.fit(Xp, Y[:, j] - ym[j]))
-            self.state["models"] = models
+                        gamma=self.options.get("gamma", "scale"), tol=1e-6)
+                models.append(m.fit(Xp, (Y[:, j] - ym[j]) / ysd[j]))
+            self.state.update(models=models, ysd=ysd)
         else:
             raise ValueError(f"unknown model type {t}")
 
@@ -309,12 +319,13 @@ class SpectralModel:
                 fr["vip"] = self._vip_from_models()
             return fr
         if t == "ANN":
-            net = st["net"]
+            nets = st.get("nets") or [st["net"]]
             return {"kind": "ann", "P": st["P"], "ts": st["ts"], "ysd": st["ysd"],
-                    "activation": net.activation, "coefs": [c for c in net.coefs_],
-                    "intercepts": [c for c in net.intercepts_], **base}
+                    "activation": nets[0].activation,
+                    "ensemble": [{"coefs": list(n.coefs_), "intercepts": list(n.intercepts_)}
+                                 for n in nets], **base}
         if t == "SVR":
-            return {"kind": "svr", **base, "models": [
+            return {"kind": "svr", **base, "ysd": st["ysd"], "models": [
                 {"kernel": m.kernel, "sv": m.support_vectors_, "dual": m.dual_coef_.ravel(),
                  "b": float(m.intercept_[0]), "gamma": float(m._gamma),
                  "degree": int(m.degree), "coef0": float(m.coef0)}
@@ -325,7 +336,8 @@ class SpectralModel:
         st = self.state
         if self.model_type == "PLS2":
             return lambda Z: st["models"][0].predict(Z).reshape(len(Z), -1)
-        return lambda Z: np.column_stack([m.predict(Z).ravel() for m in st["models"]])
+        scale = st.get("ysd", 1.0) if self.model_type == "SVR" else 1.0
+        return lambda Z: np.column_stack([m.predict(Z).ravel() for m in st["models"]]) * scale
 
     def _vip_from_models(self) -> np.ndarray:
         out = []
@@ -335,7 +347,9 @@ class SpectralModel:
             ss = np.sum(t ** 2, axis=0) * np.sum(q ** 2, axis=0)
             wn = w / np.linalg.norm(w, axis=0)
             out.append(np.sqrt(p * (wn ** 2 @ ss) / ss.sum()))
-        return np.mean(out, axis=0)
+        # PLS1: one model per compound → combine as root-mean-square so that the
+        # defining identity mean(VIP²) = 1 still holds
+        return np.sqrt(np.mean(np.square(out), axis=0))
 
     @property
     def is_fitted(self) -> bool:
@@ -362,14 +376,20 @@ class SpectralModel:
         if kind == "linear":
             return Xp @ fr["B"] + fr["b0"] + fr["y_mean"]
         if kind == "ann":
-            h = (Xp @ fr["P"]) / fr["ts"]
+            t0 = (Xp @ fr["P"]) / fr["ts"]
             act = _ACTIVATIONS[fr["activation"]]
-            n = len(fr["coefs"])
-            for i, (W, b) in enumerate(zip(fr["coefs"], fr["intercepts"])):
-                h = h @ W + b
-                if i < n - 1:
-                    h = act(h)
-            return h.reshape(len(X), -1) * fr["ysd"] + fr["y_mean"]
+            members = fr.get("ensemble") or [{"coefs": fr["coefs"],
+                                              "intercepts": fr["intercepts"]}]
+            outs = []
+            for net in members:
+                h = t0
+                n = len(net["coefs"])
+                for i, (W, b) in enumerate(zip(net["coefs"], net["intercepts"])):
+                    h = h @ np.asarray(W) + np.asarray(b)
+                    if i < n - 1:
+                        h = act(h)
+                outs.append(h.reshape(len(X), -1))
+            return np.mean(outs, axis=0) * fr["ysd"] + fr["y_mean"]
         if kind == "svr":
             cols = []
             for m in fr["models"]:
@@ -385,15 +405,13 @@ class SpectralModel:
                 else:
                     K = Xp @ sv.T
                 cols.append(K @ np.asarray(m["dual"]) + m["b"])
-            return np.column_stack(cols) + fr["y_mean"]
+            return np.column_stack(cols) * fr.get("ysd", 1.0) + fr["y_mean"]
         raise ValueError(kind)
 
     # ---------------------------------------------------------------- diagnostics
     def _fit_pca_limits(self, X: np.ndarray) -> dict:
         """PCA of the calibration spectra with 95 % / 99 % limits for
-        Hotelling T² (F distribution) and Q residuals (Box's χ² approximation,
-        Q_lim = g·χ²(h) with g = θ2/θ1, h = θ1²/θ2; unlike Jackson–Mudholkar it
-        stays valid when the residual eigenvalues are dominated by noise)."""
+        Hotelling T² (F distribution) and Q residuals (Box's χ² approximation)."""
         from scipy import stats
 
         n = X.shape[0]
@@ -404,14 +422,40 @@ class SpectralModel:
         eig = s ** 2 / max(1, n - 1)
         out = {"mean": mu, "P": vt[:k].T, "lam": eig[:k], "k": k, "n": n,
                "explained": s ** 2 / np.sum(s ** 2)}
-        rest = eig[k:]
-        th1, th2 = float(np.sum(rest)), float(np.sum(rest ** 2))
+        # T²: limit for a new observation, k(n²−1)/(n(n−k))·F(k, n−k).
+        # Q: Box's g·χ²(h). Mean = noise part (per-wavelength residual variance,
+        #    dof-corrected) + subspace-estimation part (from leave-one-out Q,
+        #    rescaled from n−1 to n samples); spread from the residual
+        #    covariance, including correlated (baseline) noise. Validated to flag
+        #    ≈ 5 % / 1 % of normal new samples with realistic noise; with purely
+        #    white noise it is conservative.
+        E = Xc - (Xc @ out["P"]) @ out["P"].T
+        dof = max(1, n - 1 - k)
+        sig2 = np.sum(E ** 2, axis=0) / dof
+        t1 = float(np.sum(sig2))
+        mean_new = t1
+        if 4 <= n <= 300:
+            q_loo = []
+            for i in range(n):
+                keep = np.arange(n) != i
+                mi = X[keep].mean(0)
+                Pi = np.linalg.svd(X[keep] - mi, full_matrices=False)[2][:k].T
+                ei = (X[i] - mi) - ((X[i] - mi) @ Pi) @ Pi.T
+                q_loo.append(float(ei @ ei))
+            mean_new = t1 + max(0.0, float(np.mean(q_loo)) - t1) * (n - 1) / n
+        ev = s ** 2 / dof
+        ev = ev[k:]
+        t2 = max(float(np.sum(sig2 ** 2)), float(np.sum(ev ** 2)) - t1 ** 2 / dof)
+        if t1 > 0 and t2 > 0:
+            var = 2 * t2 * (mean_new / t1) ** 2
+            g, h = var / (2 * mean_new), 2 * mean_new ** 2 / var
+        else:
+            g, h = np.inf, 1.0
         for a in (0.95, 0.99):
             tag = str(int(a * 100))
-            out[f"t2_lim{tag}"] = (k * (n - 1) / (n - k) * stats.f.ppf(a, k, n - k)
+            out[f"t2_lim{tag}"] = (k * (n * n - 1) / (n * (n - k)) * stats.f.ppf(a, k, n - k)
                                    if n > k else float("inf"))
-            out[f"q_lim{tag}"] = (float(th2 / th1 * stats.chi2.ppf(a, th1 ** 2 / th2))
-                                  if th1 > 0 and th2 > 0 else float("inf"))
+            out[f"q_lim{tag}"] = float(g * stats.chi2.ppf(a, h))
         return out
 
     def _t2_q(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -568,7 +612,7 @@ def _arrays(obj, key: str = ""):
     if isinstance(obj, list):
         if key in ("coefs", "intercepts"):
             return [np.asarray(v, float) for v in obj]
-        if key == "models":
+        if key in ("models", "ensemble"):
             return [_arrays(v) for v in obj]
         try:
             return np.asarray(obj, float)

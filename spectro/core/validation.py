@@ -61,6 +61,11 @@ def linear_regression(x, y, through_origin: bool = False, alpha: float = 0.05,
     p = 1 if through_origin else 2
     if n < p + 1:
         raise ValueError(f"at least {p + 1} calibration points are needed")
+    if not (np.all(np.isfinite(x)) and np.all(np.isfinite(y))):
+        raise ValueError("calibration data contain missing or non-numeric values")
+    if np.ptp(x) == 0:
+        raise ValueError("all calibration concentrations are equal — a calibration line "
+                         "needs at least two different concentrations")
     if through_origin:
         b = float(np.sum(x * y) / np.sum(x * x))
         a = 0.0
@@ -93,6 +98,16 @@ def linear_regression(x, y, through_origin: bool = False, alpha: float = 0.05,
         range=(float(x.min()), float(x.max())), through_origin=through_origin)
 
 
+def _need(values, n: int, what: str) -> np.ndarray:
+    v = np.asarray(values, float).ravel()
+    if v.size < n:
+        raise ValueError(f"{what}: at least {n} value{'s' if n > 1 else ''} needed "
+                         f"(got {v.size})")
+    if not np.all(np.isfinite(v)):
+        raise ValueError(f"{what}: contains missing or non-numeric values")
+    return v
+
+
 def lack_of_fit(x, y) -> dict:
     """Lack-of-fit F-test (requires replicate x levels)."""
     x = np.asarray(x, float)
@@ -112,7 +127,7 @@ def lack_of_fit(x, y) -> dict:
 
 
 def describe(values) -> dict:
-    v = np.asarray(values, float)
+    v = _need(values, 1, "statistics")
     mean = float(v.mean())
     sd = float(v.std(ddof=1)) if v.size > 1 else float("nan")
     return {"n": int(v.size), "mean": mean, "sd": sd,
@@ -123,8 +138,12 @@ def describe(values) -> dict:
 
 def recovery(found, taken) -> dict:
     """% recovery statistics (accuracy)."""
-    found = np.asarray(found, float)
-    taken = np.asarray(taken, float)
+    found = _need(found, 1, "found values")
+    taken = _need(taken, 1, "taken values")
+    if found.size != taken.size:
+        raise ValueError("found and taken values differ in number")
+    if np.any(taken == 0):
+        raise ValueError("a taken (added) amount is zero — recovery is undefined")
     rec = 100 * found / taken
     d = describe(rec)
     d["recoveries"] = rec.tolist()
@@ -138,7 +157,7 @@ def precision(groups: dict[str, list[float]]) -> dict:
 
 def t_test(a, b, equal_var: bool = True, alpha: float = 0.05) -> dict:
     """Student's t-test comparing two methods' results (unpaired)."""
-    a, b = np.asarray(a, float), np.asarray(b, float)
+    a, b = _need(a, 2, "first method"), _need(b, 2, "second method")
     t, p = stats.ttest_ind(a, b, equal_var=equal_var)
     dof = a.size + b.size - 2
     return {"t": float(abs(t)), "p": float(p), "t_crit": float(stats.t.ppf(1 - alpha / 2, dof)),
@@ -147,7 +166,7 @@ def t_test(a, b, equal_var: bool = True, alpha: float = 0.05) -> dict:
 
 def f_test(a, b, alpha: float = 0.05) -> dict:
     """Two-tailed variance-ratio F-test (larger variance on top)."""
-    a, b = np.asarray(a, float), np.asarray(b, float)
+    a, b = _need(a, 2, "first method"), _need(b, 2, "second method")
     va, vb = a.var(ddof=1), b.var(ddof=1)
     if va >= vb:
         f, d1, d2 = va / vb, a.size - 1, b.size - 1
@@ -159,7 +178,9 @@ def f_test(a, b, alpha: float = 0.05) -> dict:
 
 
 def anova_oneway(groups: dict[str, list[float]], alpha: float = 0.05) -> dict:
-    data = [np.asarray(v, float) for v in groups.values()]
+    data = [_need(v, 2, f"group '{k}'") for k, v in groups.items()]
+    if len(data) < 2:
+        raise ValueError("ANOVA needs at least two groups")
     f, p = stats.f_oneway(*data)
     k = len(data)
     n = sum(d.size for d in data)
@@ -177,7 +198,7 @@ def interval_hypothesis(test, reference, theta: float = 0.02, alpha: float = 0.0
     """Interval hypothesis test (Hartmann et al.): accept if the 1−2α CI of
     the ratio of means lies within [1−θ, 1+θ]. Returns the lower/upper limits
     of the ratio (as fractions)."""
-    a, b = np.asarray(test, float), np.asarray(reference, float)
+    a, b = _need(test, 2, "test method"), _need(reference, 2, "reference method")
     na, nb = a.size, b.size
     ma, mb = a.mean(), b.mean()
     sp2 = ((na - 1) * a.var(ddof=1) + (nb - 1) * b.var(ddof=1)) / (na + nb - 2)
@@ -202,7 +223,9 @@ def standard_addition(added, response) -> dict:
 
 
 def prediction_error(predicted, actual) -> dict:
-    p, a = np.asarray(predicted, float), np.asarray(actual, float)
+    p, a = _need(predicted, 1, "predicted values"), _need(actual, 1, "actual values")
+    if p.size != a.size:
+        raise ValueError("predicted and actual values differ in number")
     err = p - a
     return {"RMSEP": float(np.sqrt(np.mean(err ** 2))),
             "bias": float(err.mean()),

@@ -32,9 +32,18 @@ class Spectrum:
             )
         if x.size < 2:
             raise ValueError("a spectrum needs at least two points")
+        if not (np.all(np.isfinite(x)) and np.all(np.isfinite(y))):
+            raise ValueError("a spectrum cannot contain missing or infinite values")
         order = np.argsort(x, kind="stable")
-        self.wavelengths = x[order]
-        self.values = y[order]
+        x, y = x[order], y[order]
+        if np.any(np.diff(x) == 0):  # repeated wavelengths: average the readings
+            ux, inv = np.unique(x, return_inverse=True)
+            y = np.bincount(inv, weights=y) / np.bincount(inv)
+            x = ux
+            if x.size < 2:
+                raise ValueError("a spectrum needs at least two distinct wavelengths")
+        self.wavelengths = x
+        self.values = y
 
     # ------------------------------------------------------------------ helpers
     @property
