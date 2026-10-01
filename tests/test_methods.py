@@ -264,7 +264,9 @@ def test_every_operation_runs(pure):
         params = op.defaults()
         for p in op.params:
             if p.kind == "spectrum":
-                params[p.name] = "pure:X" if (key, p.name) == ("constant_center", "reference") else "pure:Y"
+                params[p.name] = "pure:X" if (key, p.name) in (
+                    ("constant_center", "reference"),
+                    ("divide_centered_ratio", "divisor")) else "pure:Y"
         if key == "normalize":
             params["mode"] = "max"
         if key == "t_to_a":

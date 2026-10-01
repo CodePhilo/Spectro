@@ -91,19 +91,24 @@ python tools/workflow_screenshots.py --out shots --only optimizer,univariate
 | Family | Methods |
 |---|---|
 | Pre-processing | crop, resample, Savitzky–Golay, moving average, Whittaker; baseline offset, two-point, iterative polynomial, ALS; blank subtraction and spectral arithmetic; normalisation (max, area, vector, at λ, range), SNV, %T ↔ A |
-| Zero order | direct λmax; Vierordt simultaneous equations and multi-wavelength least squares; absorbance ratio (Q-analysis); dual wavelength; induced dual wavelength; absorbance subtraction; advanced absorbance subtraction; amplitude modulation; induced amplitude modulation; area under curve (single and equations); bivariate (with Kaiser λ selection); H-point standard addition |
-| Derivative | D1–D4 (finite difference Δλ or Savitzky–Golay, scaling factor); zero-crossing; peak-to-peak; dual wavelength in derivative mode; factorized zero-order |
-| Ratio spectra | derivative ratio (DD1); ratio difference; mean centering of ratio spectra; successive derivative ratio, double divisor (sum divisor) and dual amplitude difference (ternary); ratio subtraction and extended ratio subtraction; successive spectrum subtraction (ternary); constant multiplication; constant center; spectrum subtraction; plateau/constant value |
+| Zero order | direct λmax; Vierordt simultaneous equations and multi-wavelength least squares; absorbance ratio (Q-analysis); dual wavelength; induced dual wavelength; absorbance subtraction; advanced absorbance subtraction; amplitude modulation; induced amplitude modulation; area under curve (single and binary/ternary equations); bivariate (with Kaiser λ selection); H-point standard addition; (modified) absorption factor method (MAFM) |
+| Derivative | D1–D4 (finite difference Δλ or Savitzky–Golay, scaling factor); zero-crossing; peak-to-peak; dual wavelength in derivative mode (D1 DWL); factorized zero-order; derivative transformation (DT, DT-SS); derivative subtraction (DS) and DS-CM |
+| Ratio spectra | derivative ratio (DD1) and D1 derivative ratio (D1 DR); ratio difference; mean centering of ratio spectra (binary and ternary); normalized (unit-concentration) divisors; successive derivative ratio, double divisor (sum divisor) and dual amplitude difference (ternary); ratio subtraction, extended and successive ratio subtraction (SRS); successive spectrum subtraction (ternary); constant multiplication (SS-CM, CM-SS); constant center; spectrum subtraction; plateau/constant value, constant value via amplitude difference (CV-AD), concentration value |
+| Progressive (one divisor) | *Methods → Progressive resolution*: advanced amplitude centering (AAC, partial and complete overlap), modified amplitude center (MACM), ratio difference–isoabsorptive (RIDSS), CV-AD; successive absorption factor (MAFM) |
 | Chemometrics | CLS, ILS/MLR, PCR, PLS-1, PLS-2, MCR-ALS (non-negativity + correlation constraint), ANN (MLP on PCA scores), SVR; LOO / venetian / k-fold / contiguous cross-validation with Haaland–Thomas selection of components; iPLS and GA interval selection; VIP; Hotelling T² vs Q with 95/99 % limits, outlier flags and one-click exclusion; fitted models saved in the project and exportable as `.spmodel` files (with embedded divisor spectra and checksums); progress bars with cancel for CV, iPLS, GA and fitting; Brereton 5-level multifactor calibration design |
 | Method optimizer | *Tools → Method optimizer*: from the pure standards it predicts, for every compound, the interference, noise and ±λ-robustness of every processing strategy (zero order, derivative zero-crossing, dual / induced dual wavelength, ratio difference, derivative ratio, mean centering, ratio subtraction / constant multiplication, dual amplitude difference, double divisor, Vierordt, bivariate, CLS, PLS) over all wavelengths and λ pairs; the best settings of each are verified end-to-end on simulated and laboratory mixtures and ranked; any row can be saved as a ready, calibrated method |
 | Finder tools | zero-crossing points, isoabsorptive points, maxima/minima, ratio-spectrum plateaus, equal-amplitude λ pairs |
-| Method studies | standard addition inside univariate methods (recovery of each spike + extrapolation); robustness study (each parameter ± Δ, re-calibrated and re-assayed, % deviation) |
+| Method studies | standard addition inside univariate methods (recovery of each spike + extrapolation); sample enrichment (spiking: found − added; spectrum addition); robustness study (each parameter ± Δ, re-calibrated and re-assayed, % deviation) |
 | Output | results to Excel (one sheet per result + index + methods), any table to Excel (right-click), publication figures from any plot (right-click / *Export figure*: size in mm, 300–1200 dpi TIFF/PNG or vector SVG/PDF/EPS, fonts, black-and-white mode); plot views: overlay, stacked, difference, normalized |
-| Validation (ICH Q2(R2)) | regression with SD and 95 % CI of slope and intercept, LOD/LOQ (σ of intercept or Sy/x), lack-of-fit, recovery, %RSD, one-way ANOVA, Student's t, F-test, interval hypothesis, standard addition, RMSEP/bias/SEP |
+| Validation (ICH Q2(R2)) | regression with SD and 95 % CI of slope and intercept, LOD/LOQ (σ of intercept or Sy/x), lack-of-fit, recovery, %RSD, one-way ANOVA, Student's t, F-test (one- or two-tailed critical value), interval hypothesis, standard addition, RMSEP/bias/SEP; t, F and ANOVA also from published summary values (mean, SD, n) to compare with a reported or official method |
 | Greenness | AGREE (weighted 12 principles with pictogram), Analytical Eco-Scale, GAPI |
 
 Each method is tested in `tests/test_methods.py` against synthetic binary and
-ternary mixtures with known concentrations.
+ternary mixtures with known concentrations. `tests/test_literature.py`
+validates the app against nine published papers: it recomputes their t, F
+and ANOVA values and runs each paper's method on spectra built to the paper's
+conditions. See [`docs/LITERATURE.md`](docs/LITERATURE.md) for method coverage
+and the problems found (in the app and in the papers).
 
 ## Development
 

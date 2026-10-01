@@ -91,6 +91,9 @@ def _region_mean(s: Spectrum, start: float, end: float) -> float:
 
 def savgol_derivative(s: Spectrum, order: int, window: int, polyorder: int) -> np.ndarray:
     window = int(window) | 1
+    if polyorder > 10:
+        raise ValueError("Savitzky–Golay polynomial orders above 10 are numerically unstable "
+                         "(2–4 is usual for UV spectra)")
     if window <= polyorder:
         raise ValueError("window must be larger than the polynomial order")
     if polyorder < order:
@@ -230,6 +233,8 @@ def op_baseline_poly(s, order: int, iterations: int):
            Param("iterations", "Iterations", "int", 10, minimum=1)])
 def op_baseline_als(s, lam: float, p: float, iterations: int):
     """Eilers–Boelens asymmetric least squares baseline removal."""
+    if not 0.0 < p < 1.0:
+        raise ValueError("ALS baseline: the asymmetry p must lie strictly between 0 and 1")
     y = s.values
     n = y.size
     d = sparse.diags([1.0, -2.0, 1.0], [0, 1, 2], shape=(n - 2, n))
@@ -239,7 +244,7 @@ def op_baseline_als(s, lam: float, p: float, iterations: int):
     for _ in range(int(iterations)):
         wm = sparse.diags(w)
         z = spsolve((wm + dd).tocsc(), w * y)
-        w = p * (y > z) + (1 - p) * (y < z)
+        w = np.where(y > z, p, 1 - p)    # ties keep a weight (no singular system)
     return y - z
 
 
@@ -260,14 +265,34 @@ def op_add(s, reference: Spectrum, factor: float = 1.0):
     return s.values + factor * _on_grid(reference, s)
 
 
+_DIVISOR_DERIVATIVE = [
+    Param("divisor_derivative", "Differentiate divisor first (order, 0 = no)", "int", 0,
+          minimum=0, maximum=4,
+          help="Derivative-mode ratio methods (D1 DR, derivative subtraction, DS-CM): "
+               "the divisor is differentiated (difference method, Δλ below) before use. "
+               "Differentiate the sample with an earlier Derivative step."),
+    Param("divisor_delta_lambda", "Divisor Δλ (nm)", "float", 4.0, minimum=0.001),
+]
+
+
+def _divisor_values(s: Spectrum, divisor: Spectrum, order: int = 0,
+                    delta_lambda: float = 4.0) -> np.ndarray:
+    """Divisor on the grid of ``s``, optionally as its derivative of ``order``."""
+    if int(order) > 0:
+        divisor = op_derivative(divisor, int(order), "difference", delta_lambda)
+    return _on_grid(divisor, s)
+
+
 @register("divide", "Divide by spectrum (ratio spectrum)", "Ratio spectra",
           [_ref("reference", "Divisor spectrum"),
            Param("threshold", "Ignore divisor below", "float", 1e-4, minimum=0.0,
-                 help="Points where |divisor| is below this are interpolated.")])
-def op_divide(s, reference: Spectrum, threshold: float = 1e-4):
-    """Ratio spectrum: mixture ÷ divisor."""
-    div = _on_grid(reference, s)
-    bad = np.abs(div) < threshold
+                 help="Points where |divisor| is below this are interpolated."),
+           *_DIVISOR_DERIVATIVE])
+def op_divide(s, reference: Spectrum, threshold: float = 1e-4, divisor_derivative: int = 0,
+              divisor_delta_lambda: float = 4.0):
+    """Ratio spectrum: mixture ÷ divisor (or ÷ derivative of the divisor)."""
+    div = _divisor_values(s, reference, divisor_derivative, divisor_delta_lambda)
+    bad = (np.abs(div) < threshold) | (div == 0)
     if bad.all():
         raise ValueError("divisor is zero over the whole range")
     out = np.empty_like(s.values)
@@ -275,6 +300,27 @@ def op_divide(s, reference: Spectrum, threshold: float = 1e-4):
     if bad.any():
         out[bad] = np.interp(s.wavelengths[bad], s.wavelengths[~bad], out[~bad])
     return out
+
+
+@register("divide_centered_ratio", "Divide by mean-centred ratio (ternary MCR)", "Ratio spectra",
+          [_ref("reference", "Second component Y′"), _ref("divisor", "First divisor Z′"),
+           _wl("start", "Mean-centring from (nm)", 220.0), _wl("end", "to (nm)", 300.0),
+           Param("threshold", "Ignore divisor below", "float", 1e-4, minimum=0.0)],
+          changes_grid=True)
+def op_divide_centered_ratio(s, reference: Spectrum, divisor: Spectrum, start: float, end: float,
+                             threshold: float = 1e-4) -> Spectrum:
+    """Mean centering of ratio spectra for ternary mixtures (Afkhami): the
+    mean-centred ratio spectrum MC(mixture/Z′) is divided by MC(Y′/Z′) over the
+    same range; a following *Mean centering* step removes the Y constant and
+    leaves a signal proportional to X only."""
+    s = op_crop(s, start, end)
+    y = op_crop(reference, start, end)
+    ratio = op_divide(y, divisor)
+    centred = ratio - ratio.mean()
+    if np.max(np.abs(centred)) <= 1e-9 * max(np.max(np.abs(ratio)), 1e-300):
+        raise ValueError("Y′/Z′ is constant (proportional spectra) — choose a different "
+                         "second component or divisor")
+    return s.with_values(op_divide(s, y.with_values(centred), threshold))
 
 
 @register("divide_sum", "Divide by sum of two spectra (double divisor)", "Ratio spectra",
@@ -329,11 +375,19 @@ def op_subtract_plateau(s, start: float, end: float):
 # --------------------------------------------------------------------------- #
 @register("normalize", "Normalize", "Normalization",
           [Param("mode", "Mode", "choice", "max",
-                 choices=("max", "area", "vector", "wavelength", "range")),
+                 choices=("max", "area", "vector", "wavelength", "range", "concentration")),
            _wl("wavelength", "At wavelength (nm)", None, optional=True)])
 def op_normalize(s, mode: str, wavelength: float | None = None):
-    """Scale to unit maximum, area, vector norm, value at λ, or min–max range."""
+    """Scale to unit maximum, area, vector norm, value at λ, min–max range, or
+    unit concentration ('concentration': ÷ the spectrum's concentration — the
+    *normalized spectrum* used as divisor in AM, CV and concentration value)."""
     y = s.values
+    if mode == "concentration":
+        c = [v for v in s.concentrations.values() if v]
+        if len(c) != 1:
+            raise ValueError("unit-concentration normalisation needs a pure standard with "
+                             "exactly one non-zero concentration")
+        return y / c[0]
     if mode == "max":
         d = np.max(np.abs(y))
     elif mode == "area":
@@ -388,7 +442,7 @@ def op_a_to_t(s, percent: bool = True):
                  choices=("difference", "savitzky_golay")),
            Param("delta_lambda", "Δλ (nm) [difference]", "float", 4.0, minimum=0.001),
            Param("window", "Window (points) [S-G]", "int", 11, minimum=3),
-           Param("polyorder", "Polynomial order [S-G]", "int", 3, minimum=1),
+           Param("polyorder", "Polynomial order [S-G]", "int", 3, minimum=1, maximum=10),
            Param("scaling", "Scaling factor", "float", 1.0,
                  help="Multiply the result (instrument 'scaling factor').")],
           changes_grid=True)
@@ -415,27 +469,38 @@ def op_derivative(s, order: int, method: str = "difference", delta_lambda: float
 # --------------------------------------------------------------------------- #
 @register("ratio_subtraction", "Ratio subtraction (recover X)", "Spectrum resolution",
           [_ref("divisor", "Divisor Y′ (pure extended component)"),
-           _wl("start", "Plateau from (nm)", 300.0), _wl("end", "to (nm)", 320.0)])
-def op_ratio_subtraction(s, divisor: Spectrum, start: float, end: float):
-    """[(X+Y)/Y′ − constant] × Y′ → zero-order spectrum of X.
+           _wl("start", "Plateau from (nm)", 300.0), _wl("end", "to (nm)", 320.0),
+           *_DIVISOR_DERIVATIVE])
+def op_ratio_subtraction(s, divisor: Spectrum, start: float, end: float,
+                         divisor_derivative: int = 0, divisor_delta_lambda: float = 4.0):
+    """[(X+Y)/Y′ − constant] × Y′ → spectrum of X (= spectrum subtraction of
+    the constant-multiplied Y).
 
     The constant is the plateau of the ratio spectrum where only Y absorbs.
+    With a differentiated divisor (and a differentiated sample) this is
+    derivative subtraction (DS) and gives the D1…D4 spectrum of X.
     """
-    d = _on_grid(divisor, s)
-    ratio = op_divide(s, divisor)
+    d = _divisor_values(s, divisor, divisor_derivative, divisor_delta_lambda)
+    ratio = op_divide(s, s.with_values(d))
     plateau = _region_mean(s.with_values(ratio), start, end)
-    return (ratio - plateau) * d
+    # [(X+Y)/Y′ − k]·Y′ written as (X+Y) − k·Y′: identical algebra, but it
+    # keeps the spectrum where Y′ ≈ 0 (there the ratio is undefined)
+    return s.values - plateau * d
 
 
 @register("constant_multiplication", "Constant multiplication (recover Y)",
           "Spectrum resolution",
           [_ref("divisor", "Divisor Y′ (pure extended component)"),
-           _wl("start", "Plateau from (nm)", 300.0), _wl("end", "to (nm)", 320.0)])
-def op_constant_multiplication(s, divisor: Spectrum, start: float, end: float):
-    """constant × Y′ → zero-order spectrum of Y (constant = ratio plateau)."""
-    ratio = op_divide(s, divisor)
+           _wl("start", "Plateau from (nm)", 300.0), _wl("end", "to (nm)", 320.0),
+           *_DIVISOR_DERIVATIVE])
+def op_constant_multiplication(s, divisor: Spectrum, start: float, end: float,
+                               divisor_derivative: int = 0, divisor_delta_lambda: float = 4.0):
+    """constant × Y′ → spectrum of Y (constant = ratio plateau). With a
+    differentiated divisor and sample this is DS-CM and gives Y's derivative."""
+    d = _divisor_values(s, divisor, divisor_derivative, divisor_delta_lambda)
+    ratio = op_divide(s, s.with_values(d))
     plateau = _region_mean(s.with_values(ratio), start, end)
-    return plateau * _on_grid(divisor, s)
+    return plateau * d
 
 
 @register("extended_ratio_subtraction", "Extended ratio subtraction (recover Y)",
@@ -465,31 +530,50 @@ _FACTOR_PARAMS = [
     Param("derivative_order", "Signal: derivative order (0 = absorbance)", "int", 0,
           minimum=0, maximum=4),
     Param("delta_lambda", "Δλ (nm)", "float", 4.0, minimum=0.001),
+    _wl("wavelength_end", "…to (nm) — plateau range (blank = single λ)", None, optional=True,
+        help="Give a range to take k as the mean of signal(mixture)/signal(pure) over the "
+             "plateau (constant value / derivative transformation)."),
 ]
 
 
-@register("factorized_recovery", "Factorized spectrum / spectrum scaling",
+def _factor(s: Spectrum, ref: Spectrum, wavelength: float, derivative_order: int,
+            delta_lambda: float, wavelength_end: float | None) -> float:
+    ts = _transform(s, derivative_order, delta_lambda)
+    tr = _transform(ref, derivative_order, delta_lambda)
+    if wavelength_end is None:
+        return ts.value_at(wavelength) / tr.value_at(wavelength)
+    lo, hi = sorted((wavelength, wavelength_end))
+    xs, ys = ts.region(lo, hi)
+    yr = np.interp(xs, tr.wavelengths, tr.values)
+    if np.any(np.abs(yr) < 1e-12):
+        raise ValueError("the pure-component signal is zero inside the plateau range")
+    return float(np.mean(ys / yr))
+
+
+@register("factorized_recovery", "Factorized spectrum / derivative transformation",
           "Spectrum resolution", _FACTOR_PARAMS)
 def op_factorized_recovery(s, reference: Spectrum, wavelength: float,
-                           derivative_order: int = 0, delta_lambda: float = 4.0):
+                           derivative_order: int = 0, delta_lambda: float = 4.0,
+                           wavelength_end: float | None = None):
     """Recover a component's zero-order spectrum: k × pure spectrum, where
     k = signal(mixture, λ) / signal(pure, λ). With derivative order 0 this is
-    spectrum scaling; with order ≥ 1 it is the factorized zero-order method
-    (λ = zero-crossing of the other component)."""
+    spectrum scaling / constant multiplication; with order ≥ 1 it is the
+    factorized zero-order method or, with a plateau range, the derivative
+    transformation (DT) method (k = plateau of D(mixture)/D(normalised pure))."""
     ref = s.with_values(_on_grid(reference, s))
-    k = (_transform(s, derivative_order, delta_lambda).value_at(wavelength)
-         / _transform(ref, derivative_order, delta_lambda).value_at(wavelength))
-    return k * ref.values
+    return _factor(s, ref, wavelength, derivative_order, delta_lambda,
+                   wavelength_end) * ref.values
 
 
 @register("spectrum_subtraction", "Spectrum subtraction", "Spectrum resolution",
           _FACTOR_PARAMS)
 def op_spectrum_subtraction(s, reference: Spectrum, wavelength: float,
-                            derivative_order: int = 0, delta_lambda: float = 4.0):
+                            derivative_order: int = 0, delta_lambda: float = 4.0,
+                            wavelength_end: float | None = None):
     """Mixture − k × pure spectrum (k as in factorized recovery) → the other
-    component's spectrum."""
+    component's spectrum (CM-SS, DT-SS)."""
     return s.values - op_factorized_recovery(s, reference, wavelength,
-                                             derivative_order, delta_lambda)
+                                             derivative_order, delta_lambda, wavelength_end)
 
 
 @register("constant_center", "Constant center (recover X or Y)", "Spectrum resolution",
@@ -509,7 +593,7 @@ def op_constant_center(s, divisor: Spectrum, reference: Spectrum, w1: float,
         raise ValueError("λ1 and λ2 give equal X amplitudes; choose other wavelengths")
     p1, p2 = p.value_at(w1), p.value_at(w2)
     k = p2 - (p1 - p2) / (r - 1)
-    return (p.values - k) * d if target == "X" else k * d
+    return s.values - k * d if target == "X" else k * d
 
 
 # --------------------------------------------------------------------------- #

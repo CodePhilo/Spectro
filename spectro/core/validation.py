@@ -164,17 +164,93 @@ def t_test(a, b, equal_var: bool = True, alpha: float = 0.05) -> dict:
             "dof": dof, "significant": bool(p < alpha)}
 
 
-def f_test(a, b, alpha: float = 0.05) -> dict:
-    """Two-tailed variance-ratio F-test (larger variance on top)."""
+def f_test(a, b, alpha: float = 0.05, tails: int = 1) -> dict:
+    """Variance-ratio F-test, larger variance on top.
+
+    ``tails=1`` (default) compares with F(1−α; ν1, ν2) — the tabulated value
+    used in pharmaceutical method-comparison papers (e.g. 5.05 for n = 6 and 6).
+    ``tails=2`` uses F(1−α/2) (Miller & Miller two-sided test, 7.15 for 6/6).
+    Both critical values are returned."""
     a, b = _need(a, 2, "first method"), _need(b, 2, "second method")
-    va, vb = a.var(ddof=1), b.var(ddof=1)
-    if va >= vb:
-        f, d1, d2 = va / vb, a.size - 1, b.size - 1
+    return f_test_summary(float(a.std(ddof=1)), a.size, float(b.std(ddof=1)), b.size,
+                          alpha, tails)
+
+
+def _check_summary(sd: float, n: int, what: str) -> None:
+    if not (np.isfinite(sd) and sd >= 0):
+        raise ValueError(f"{what}: the standard deviation must be a non-negative number")
+    if int(n) != n or n < 2:
+        raise ValueError(f"{what}: n must be a whole number ≥ 2")
+
+
+def t_test_summary(mean1: float, sd1: float, n1: int, mean2: float, sd2: float, n2: int,
+                   alpha: float = 0.05, equal_var: bool = True) -> dict:
+    """Student's t-test from summary statistics (mean, SD, n of each method) —
+    e.g. to check a published comparison with a reported/official method.
+    Pooled variance (equal_var) or Welch's test."""
+    _check_summary(sd1, n1, "first method")
+    _check_summary(sd2, n2, "second method")
+    v1, v2 = sd1 ** 2, sd2 ** 2
+    if equal_var:
+        dof = n1 + n2 - 2
+        sp2 = ((n1 - 1) * v1 + (n2 - 1) * v2) / dof
+        se = np.sqrt(sp2 * (1 / n1 + 1 / n2))
     else:
-        f, d1, d2 = vb / va, b.size - 1, a.size - 1
-    p = min(1.0, 2 * stats.f.sf(f, d1, d2))
-    return {"F": float(f), "p": float(p), "F_crit": float(stats.f.ppf(1 - alpha / 2, d1, d2)),
-            "dof": (d1, d2), "significant": bool(p < alpha)}
+        se = np.sqrt(v1 / n1 + v2 / n2)
+        dof = (v1 / n1 + v2 / n2) ** 2 / ((v1 / n1) ** 2 / (n1 - 1) + (v2 / n2) ** 2 / (n2 - 1))
+    if se == 0:
+        raise ValueError("both standard deviations are zero — the t-test is undefined")
+    t = abs(mean1 - mean2) / se
+    p = 2 * stats.t.sf(t, dof)
+    return {"t": float(t), "p": float(p), "t_crit": float(stats.t.ppf(1 - alpha / 2, dof)),
+            "dof": float(dof) if not equal_var else int(dof), "significant": bool(p < alpha)}
+
+
+def f_test_summary(sd1: float, n1: int, sd2: float, n2: int, alpha: float = 0.05,
+                   tails: int = 1) -> dict:
+    """F-test from two standard deviations (larger variance on top)."""
+    _check_summary(sd1, n1, "first method")
+    _check_summary(sd2, n2, "second method")
+    if tails not in (1, 2):
+        raise ValueError("tails must be 1 or 2")
+    v1, v2 = sd1 ** 2, sd2 ** 2
+    if v1 == 0 and v2 == 0:
+        raise ValueError("both standard deviations are zero — the F-test is undefined")
+    if v1 >= v2:
+        f, d1, d2 = (v1 / v2 if v2 else float("inf")), int(n1) - 1, int(n2) - 1
+    else:
+        f, d1, d2 = v2 / v1, int(n2) - 1, int(n1) - 1
+    one = float(stats.f.ppf(1 - alpha, d1, d2))
+    two = float(stats.f.ppf(1 - alpha / 2, d1, d2))
+    p = float(stats.f.sf(f, d1, d2)) * tails
+    return {"F": float(f), "p": min(1.0, p), "F_crit": one if tails == 1 else two,
+            "F_crit_one_tailed": one, "F_crit_two_tailed": two, "tails": tails,
+            "dof": (d1, d2), "significant": bool(f > (one if tails == 1 else two))}
+
+
+def anova_summary(groups: dict[str, tuple[float, float, int]], alpha: float = 0.05) -> dict:
+    """One-way ANOVA from (mean, SD, n) of each group."""
+    if len(groups) < 2:
+        raise ValueError("ANOVA needs at least two groups")
+    for k, (_, sd, n) in groups.items():
+        _check_summary(sd, n, f"group '{k}'")
+    m = np.array([g[0] for g in groups.values()], float)
+    sd = np.array([g[1] for g in groups.values()], float)
+    n = np.array([g[2] for g in groups.values()], float)
+    k, total = m.size, n.sum()
+    grand = float(np.sum(n * m) / total)
+    ss_b = float(np.sum(n * (m - grand) ** 2))
+    ss_w = float(np.sum((n - 1) * sd ** 2))
+    df_b, df_w = k - 1, int(total - k)
+    ms_b, ms_w = ss_b / df_b, ss_w / df_w
+    if ms_w == 0:
+        raise ValueError("all within-group standard deviations are zero")
+    f = ms_b / ms_w
+    p = float(stats.f.sf(f, df_b, df_w))
+    return {"F": float(f), "p": p, "F_crit": float(stats.f.ppf(1 - alpha, df_b, df_w)),
+            "ss_between": ss_b, "ss_within": ss_w, "df_between": df_b, "df_within": df_w,
+            "ms_between": float(ms_b), "ms_within": float(ms_w), "grand_mean": grand,
+            "significant": bool(p < alpha)}
 
 
 def anova_oneway(groups: dict[str, list[float]], alpha: float = 0.05) -> dict:

@@ -54,6 +54,8 @@ LINEAR_STEPS = {
     "factorized_recovery": {"reference": "div", "wavelength": 350.0, "derivative_order": 0},
     "spectrum_subtraction": {"reference": "div", "wavelength": 350.0, "derivative_order": 1},
     "constant_center": {"divisor": "div", "reference": "ref", "w1": 240.0, "w2": 260.0},
+    "divide_centered_ratio": {"reference": "ref", "divisor": "div", "start": 220.0,
+                              "end": 300.0},
 }
 
 

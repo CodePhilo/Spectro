@@ -81,7 +81,7 @@ def test_tests_match_scipy():
     t = val.t_test(a, b)
     ref = stats.ttest_ind(a, b)
     assert t["t"] == pytest.approx(abs(ref.statistic)) and t["p"] == pytest.approx(ref.pvalue)
-    f = val.f_test(a, b)
+    f = val.f_test(a, b, tails=2)
     va, vb = a.var(ddof=1), b.var(ddof=1)
     F = max(va, vb) / min(va, vb)
     assert f["F"] == pytest.approx(F)

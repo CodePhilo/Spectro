@@ -187,6 +187,7 @@ class ValidationDialog(Base):
             "Accuracy": ["Taken", "Found"],
             "Precision": ["Level / day 1", "Level / day 2", "Level / day 3"],
             "Compare methods": ["Proposed method", "Reference method"],
+            "Compare (mean, SD, n)": ["Method", "Mean", "SD", "n"],
             "Standard addition": ["Added", "Response"],
         }
         for name, cols in specs.items():
@@ -212,6 +213,18 @@ class ValidationDialog(Base):
                 self.theta = _spin(2.0, 0.1, 50, 1, " %")
                 row.addWidget(QLabel("Interval θ"))
                 row.addWidget(self.theta)
+            if name in ("Compare methods", "Compare (mean, SD, n)"):
+                tails = QComboBox()
+                tails.addItems(["F one-tailed (tabulated, e.g. 5.05 for 6/6)",
+                                "F two-tailed (α/2)"])
+                tails.setToolTip("Method-comparison papers quote the one-tailed F(0.05) "
+                                 "table value; both critical values are always reported.")
+                row.addWidget(tails)
+                setattr(self, "tails_summary" if "SD" in name else "tails", tails)
+            if name == "Compare (mean, SD, n)":
+                t.setToolTip("First row = reported / official (reference) method; each other "
+                             "row is compared with it. With three or more rows a one-way "
+                             "ANOVA from the summary values is added.")
             calc = QPushButton("Calculate")
             calc.clicked.connect(lambda _=False, n=name: self._calc(n))
             row.addWidget(calc)
@@ -302,7 +315,8 @@ class ValidationDialog(Base):
             elif name == "Compare methods":
                 a = t.column_floats(0)
                 b = t.column_floats(1)
-                tt, ff = val.t_test(a, b), val.f_test(a, b)
+                tt = val.t_test(a, b)
+                ff = val.f_test(a, b, tails=self.tails.currentIndex() + 1)
                 ih = val.interval_hypothesis(a, b, self.theta.value() / 100)
                 da, db = val.describe(a), val.describe(b)
                 rows = [["Proposed: mean ± SD", f"{da['mean']:.4f} ± {da['sd']:.4f} (n={da['n']})"],
@@ -316,6 +330,8 @@ class ValidationDialog(Base):
                         ["Conclusion", "no significant difference" if not tt["significant"] and
                          not ff["significant"] else "significant difference"]]
                 data = {"t": tt, "F": ff, "interval": ih}
+            elif name == "Compare (mean, SD, n)":
+                rows, data = self._compare_summary(t)
             else:
                 x, y = self._pairs(t)
                 d = val.standard_addition(x, y)
@@ -331,6 +347,45 @@ class ValidationDialog(Base):
             return
         fill_table(self.out, ["Parameter", "Value"], rows)
         self._done(name, data)
+
+    def _compare_summary(self, t: PasteTable):
+        groups = {}
+        for i in range(t.rowCount()):
+            cells = [t.item(i, j).text().strip().replace(",", ".") if t.item(i, j) else ""
+                     for j in range(4)]
+            if not any(cells[1:]):
+                continue
+            try:
+                mean, sd, n = float(cells[1]), float(cells[2]), float(cells[3])
+            except ValueError:
+                raise ValueError(f"row {i + 1}: mean, SD and n must be numbers") from None
+            groups[cells[0] or f"Method {i + 1}"] = (mean, sd, int(n) if n == int(n) else n)
+        if len(groups) < 2:
+            raise ValueError("enter the reference method (first row) and at least one other")
+        names = list(groups)
+        ref = groups[names[0]]
+        tails = self.tails_summary.currentIndex() + 1
+        rows, comps = [], {}
+        for nm in names[1:]:
+            g = groups[nm]
+            tt = val.t_test_summary(g[0], g[1], g[2], ref[0], ref[1], ref[2])
+            ff = val.f_test_summary(g[1], g[2], ref[1], ref[2], tails=tails)
+            comps[nm] = {"t": tt, "F": ff}
+            rows.append([f"{nm} vs {names[0]}",
+                         f"t = {tt['t']:.3f} ({tt['t_crit']:.3f}); F = {ff['F']:.3f} "
+                         f"({ff['F_crit']:.3f}) → " +
+                         ("significant difference" if tt["significant"] or ff["significant"]
+                          else "no significant difference")])
+        data = {"groups": groups, "comparisons": comps, "reference": names[0]}
+        if len(groups) >= 3:
+            an = val.anova_summary(groups)
+            data["anova"] = an
+            rows += [["ANOVA between groups: SS, df, MS",
+                      f"{an['ss_between']:.4f}, {an['df_between']}, {an['ms_between']:.4f}"],
+                     ["ANOVA within groups: SS, df, MS",
+                      f"{an['ss_within']:.4f}, {an['df_within']}, {an['ms_within']:.4f}"],
+                     ["ANOVA F (F crit), p", f"{an['F']:.4f} ({an['F_crit']:.4f}), {an['p']:.4f}"]]
+        return rows, data
 
     def _done(self, name, data):
         self.last = (name, data)

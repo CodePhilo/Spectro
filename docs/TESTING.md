@@ -13,6 +13,7 @@ The suite is organised by *what kind of error it can catch*.
 | `test_reference.py` | **wrong numbers** | every statistic and algorithm compared with an independent implementation: regression vs `scipy.stats.linregress` (slope, intercept, r, SDs, CIs, LOD/LOQ), lack-of-fit, t/F/ANOVA vs SciPy, derivatives vs analytic polynomials, PLS vs scikit-learn, PCR/ILS vs linear algebra, CLS/MCR-ALS exact on noiseless data, frozen ANN/SVR vs scikit-learn, VIP and Hotelling identities, LOO CV vs a manual loop, Q-analysis vs simultaneous equations, greenness formulas; statistics refuse insufficient input |
 | `test_properties.py` | **hidden assumptions** | Hypothesis property tests: every processing step used by the optimizer is linear; every registered operation is classified; results do not depend on the concentration unit, sample order, wavelength spacing or direction; 300 random pipelines and 150 random measurements fail only with clear `ValueError`s and never leak NaN; random spectra round-trip through every file format; T²/Q limits flag ≈ 5 % / 1 % of normal new samples; the optimizer finds a known best method |
 | `test_integrity.py` | **bad input, data integrity, end-to-end** | unusable files, BOM/CRLF/unicode minus/footers, duplicate wavelengths, missing Excel cells, a 120-spectrum file, unicode names; every mutation writes exactly one audit entry and no-op edits none; failed operations leave no trace; tampering with data or the log is detected; two app instances on one file; foreign files refused; chained derivations replay after archiving references; stored demo results equal a from-scratch NumPy calculation; Excel export equals stored numbers; PDF/HTML report |
+| `test_literature.py` | **disagreement with the published literature** | 88 published t/F values, ANOVAs and recovery statistics from nine papers recomputed from their summary values; every method of those papers (AAC, MACM, RIDSS, CV-AD, MAFM, ternary AUC and MCR, double divisor, SRS, DS-CM, D1 DR, DT, CM-SS, concentration value, AM with unit divisor, enrichment) run on spectra built to each paper's conditions; see [`LITERATURE.md`](LITERATURE.md) |
 | `test_ui_edge.py` | **crashes** | every dialog action on an empty project, a project without compounds and a project with data; main-window actions without a project or selection |
 | `test_methods.py`, `test_optimizer.py`, `test_io.py`, `test_project.py`, `test_tables.py`, `test_demo.py`, `test_ui.py` | feature tests | every method recovers known concentrations; feature flows |
 
@@ -35,6 +36,12 @@ The suite is organised by *what kind of error it can catch*.
 | 13 | Statistics | empty / one-value inputs produced NaN tables | minimum-size checks with messages |
 | 14 | Baseline / SNV | equal baseline wavelengths or a constant spectrum divided by zero | clear messages |
 | 15 | UI | the spectral finder crashed on a project without spectra | message instead |
+| 16 | Ratio subtraction | [(mixture ÷ Y′) − k] × Y′ was **wrong wherever Y′ ≈ 0** (ratio interpolated), e.g. 0.30 AU error at 229 nm in successive ratio subtraction; also constant center | computed as mixture − k·Y′ (same algebra, exact everywhere) |
+| 17 | F-test | critical value was two-tailed (7.15 for 6/6) while the literature uses the one-tailed table value (5.05) | one-tailed by default, both reported, selectable |
+| 18 | Divide | an exact-zero divisor point raised a divide-by-zero warning with threshold 0 | treated as below threshold |
+| 19 | ALS baseline | asymmetry p = 0 or 1 gave a singular matrix | refused with a message; ties keep a weight |
+| 20 | Robustness | derivative orders were varied by ±1 | not varied |
+| 21 | Savitzky–Golay | polynomial orders up to the window length were accepted; order 18 gave an ill-conditioned fit (NumPy RankWarning) | orders above 10 refused (2–4 is usual) |
 
 ## Known limitations (documented, not bugs)
 

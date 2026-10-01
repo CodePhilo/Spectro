@@ -139,6 +139,10 @@ class UnivariateMethod:
                                                        "params": {"w1": 260.0}})
     through_origin: bool = False
     regression: Regression | None = None
+    # concentration value method: the signal (e.g. the plateau of a ratio
+    # spectrum with a unit-concentration divisor) IS the concentration; the
+    # calibration line is still computed and reported, but not used to predict
+    direct: bool = False
 
     def signal(self, s: Spectrum, resolve: Resolver | None = None) -> float:
         return measure(apply_pipeline(s, self.steps, resolve), self._measurement(resolve),
@@ -171,14 +175,25 @@ class UnivariateMethod:
         return self.regression
 
     def predict(self, s: Spectrum, resolve: Resolver | None = None) -> float:
+        if self.direct:
+            return float(self.signal(s, resolve))
         if self.regression is None:
             raise RuntimeError("method is not calibrated")
         return float(self.regression.predict_x(self.signal(s, resolve)))
 
+    def concentration(self, signal: float) -> float:
+        """Concentration from a signal (calibration line, or the signal itself
+        for the concentration value method)."""
+        if self.direct:
+            return float(signal)
+        if self.regression is None:
+            raise RuntimeError("method is not calibrated")
+        return float(self.regression.predict_x(signal))
+
     def to_dict(self) -> dict:
         return {"type": "univariate", "name": self.name, "compound": self.compound,
                 "steps": self.steps, "measurement": self.measurement,
-                "through_origin": self.through_origin,
+                "through_origin": self.through_origin, "direct": self.direct,
                 "regression": self.regression.to_dict() if self.regression else None}
 
     @classmethod
@@ -186,12 +201,14 @@ class UnivariateMethod:
         reg = d.get("regression")
         return cls(d["name"], d["compound"], d.get("steps", []), d["measurement"],
                    d.get("through_origin", False),
-                   Regression.from_dict(reg) if reg else None)
+                   Regression.from_dict(reg) if reg else None, d.get("direct", False))
 
 
 # --------------------------------------------------------------------------- #
 # Method templates (pre-filled pipelines for the UI wizard)
 # --------------------------------------------------------------------------- #
+_D1 = {"op": "derivative", "params": {"order": 1, "delta_lambda": 4.0, "scaling": 10.0}}
+
 TEMPLATES: dict[str, dict[str, Any]] = {
     "Direct (zero order, λmax)": {
         "steps": [], "measurement": {"kind": "amplitude", "params": {"w1": 260.0}}},
@@ -278,6 +295,51 @@ TEMPLATES: dict[str, dict[str, Any]] = {
                    "params": {"divisor": None, "reference": None, "w1": 230.0,
                               "w2": 260.0, "target": "X"}}],
         "measurement": {"kind": "amplitude", "params": {"w1": 260.0}}},
+    "Spectrum subtraction–constant multiplication (SS-CM, Y)": {
+        "steps": [{"op": "constant_multiplication",
+                   "params": {"divisor": None, "start": 300.0, "end": 320.0}}],
+        "measurement": {"kind": "amplitude", "params": {"w1": 290.0}}},
+    "Derivative subtraction (DS, X in D1)": {
+        "steps": [_D1, {"op": "ratio_subtraction",
+                        "params": {"divisor": None, "start": 300.0, "end": 320.0,
+                                   "divisor_derivative": 1, "divisor_delta_lambda": 4.0}}],
+        "measurement": {"kind": "amplitude", "params": {"w1": 245.0}}},
+    "Derivative subtraction–constant multiplication (DS-CM, Y in D1)": {
+        "steps": [_D1, {"op": "constant_multiplication",
+                        "params": {"divisor": None, "start": 300.0, "end": 320.0,
+                                   "divisor_derivative": 1, "divisor_delta_lambda": 4.0}}],
+        "measurement": {"kind": "amplitude", "params": {"w1": 320.0}}},
+    "Derivative ratio of D1 spectra (D1 DR)": {
+        "steps": [_D1, {"op": "divide", "params": {"reference": None, "divisor_derivative": 1,
+                                                   "divisor_delta_lambda": 4.0}},
+                  _D1],
+        "measurement": {"kind": "amplitude", "params": {"w1": 270.0}}},
+    "Successive ratio subtraction (ternary SRS, Z)": {
+        "steps": [{"op": "ratio_subtraction",
+                   "params": {"divisor": None, "start": 315.0, "end": 365.0}},
+                  {"op": "ratio_subtraction",
+                   "params": {"divisor": None, "start": 275.0, "end": 305.0}}],
+        "measurement": {"kind": "amplitude", "params": {"w1": 240.0}}},
+    "Mean centering of ratio spectra (ternary)": {
+        "steps": [{"op": "divide", "params": {"reference": None}},
+                  {"op": "mean_center", "params": {"start": 215.0, "end": 275.0}},
+                  {"op": "divide_centered_ratio",
+                   "params": {"reference": None, "divisor": None, "start": 215.0,
+                              "end": 275.0}},
+                  {"op": "mean_center", "params": {"start": 215.0, "end": 275.0}}],
+        "measurement": {"kind": "amplitude", "params": {"w1": 250.0}}},
+    "Ratio difference with normalized divisor": {
+        "steps": [{"op": "divide", "params": {"reference": None}}],
+        "measurement": {"kind": "difference", "params": {"w1": 264.0, "w2": 225.0}}},
+    "Derivative transformation (DT, recover zero order)": {
+        "steps": [{"op": "factorized_recovery",
+                   "params": {"reference": None, "wavelength": 306.0, "wavelength_end": 313.0,
+                              "derivative_order": 1, "delta_lambda": 4.0}}],
+        "measurement": {"kind": "amplitude", "params": {"w1": 294.0}}},
+    "Concentration value (unit divisor plateau, no regression)": {
+        "steps": [{"op": "divide", "params": {"reference": None}}],
+        "measurement": {"kind": "mean", "params": {"w1": 330.0, "w2": 333.0}},
+        "direct": True},
 }
 
 
@@ -503,6 +565,225 @@ class AdvancedAbsorbanceSubtraction:
         return {"X": cx, "Y": float(self.y_regression.predict_x(ay))}
 
 
+# --------------------------------------------------------------------------- #
+# Progressive (successive) resolution of binary, ternary … mixtures
+# --------------------------------------------------------------------------- #
+def _ratio(s: Spectrum, divisor: Spectrum) -> Spectrum:
+    from spectro.core.operations import op_divide
+    return s.with_values(op_divide(s, divisor))
+
+
+def _conc(s: Spectrum, compound: str) -> float:
+    if compound not in s.concentrations:
+        raise ValueError(f"no {compound} concentration for '{s.name}'")
+    return float(s.concentrations[compound])
+
+
+@dataclass
+class AmplitudeCentering:
+    """Progressive resolution on ONE ratio spectrum at ONE wavelength λc.
+
+    The mixture is divided by one divisor (Z′, usually the normalised spectrum
+    of one component). In the ratio spectrum, each component's amplitude at λc
+    is obtained in turn:
+
+    * ``plateau`` (optional): the flat region where only the divisor compound
+      remains → its constant (amplitude calculation). The constant is
+      subtracted before the differences below are measured.
+    * ``differences[c] = {"w1", "w2", "factor_from"}``: P(λ1) − F·P(λ2) of the
+      ratio spectrum depends on c only (the other components have equal
+      amplitudes, F = 1, or F = P(λ1)/P(λ2) of the compound named in
+      ``factor_from`` — the amplitude/equality factor). A regression of this
+      difference against c's own amplitude at λc (pure c standards) gives
+      c's *postulated* amplitude at λc (amplitude difference).
+    * ``subtract``: the remaining compound's amplitude = recorded amplitude at
+      λc − all the others (amplitude subtraction).
+
+    Each amplitude at λc is converted to concentration with that compound's
+    regression at λc (or one *unified* regression when λc is an isoabsorptive
+    point). This one class covers advanced amplitude centering (AAC, partial
+    and complete overlap), the modified amplitude center method (MACM),
+    ratio difference–isoabsorptive (RIDSS) and constant value via amplitude
+    difference (CV-AD), and amplitude modulation as the binary special case.
+    """
+
+    wavelength: float
+    compounds: list[str]
+    subtract: str | None = None
+    divisor_compound: str | None = None
+    plateau: tuple[float, float] | None = None
+    differences: dict[str, dict] = field(default_factory=dict)
+    unified: bool = False
+    factors: dict[str, float] = field(default_factory=dict)
+    diff_regressions: dict[str, Regression] = field(default_factory=dict)
+    regressions: dict[str, Regression] = field(default_factory=dict)
+
+    def _check(self) -> None:
+        known = set(self.differences) | ({self.subtract} if self.subtract else set())
+        if self.plateau is not None:
+            if not self.divisor_compound:
+                raise ValueError("a plateau needs the divisor compound")
+            known.add(self.divisor_compound)
+        missing = [c for c in self.compounds if c not in known]
+        if missing:
+            raise ValueError(f"no way to resolve: {', '.join(missing)} — give a λ pair, the "
+                             "plateau or amplitude subtraction for every compound")
+        if self.subtract and (self.subtract in self.differences or
+                              (self.plateau is not None and self.subtract == self.divisor_compound)):
+            raise ValueError(f"{self.subtract} is resolved twice")
+
+    def _difference(self, r: Spectrum, c: str) -> float:
+        d = self.differences[c]
+        return r.value_at(d["w1"]) - self.factors.get(c, 1.0) * r.value_at(d["w2"])
+
+    def _centred(self, r: Spectrum) -> tuple[Spectrum, float | None]:
+        if self.plateau is None:
+            return r, None
+        const = float(np.mean(r.region(*self.plateau)[1]))
+        return r.with_values(r.values - const), const
+
+    def fit(self, standards: dict[str, list[Spectrum]], divisor: Spectrum) -> dict:
+        """``standards``: pure standards of each compound (compound → spectra)."""
+        self._check()
+        for c in self.compounds:
+            if len(standards.get(c, [])) < 3:
+                raise ValueError(f"check at least three pure {c} standards")
+        ratios = {c: [_ratio(s, divisor) for s in standards[c]] for c in self.compounds}
+        for c, d in self.differences.items():
+            src = d.get("factor_from")
+            if src:
+                if src not in ratios:
+                    raise ValueError(f"factor compound {src} has no standards")
+                self.factors[c] = float(np.mean([r.value_at(d["w1"]) / r.value_at(d["w2"])
+                                                 for r in ratios[src]]))
+            self.diff_regressions[c] = linear_regression(
+                [r.value_at(self.wavelength) for r in ratios[c]],
+                [self._difference(self._centred(r)[0], c) for r in ratios[c]])
+        if self.unified:
+            xs, ys = [], []
+            for c in self.compounds:
+                xs += [_conc(s, c) for s in standards[c]]
+                ys += [r.value_at(self.wavelength) for r in ratios[c]]
+            reg = linear_regression(xs, ys)
+            self.regressions = {c: reg for c in self.compounds}
+        else:
+            self.regressions = {c: linear_regression([_conc(s, c) for s in standards[c]],
+                                                     [r.value_at(self.wavelength)
+                                                      for r in ratios[c]])
+                                for c in self.compounds}
+        return {"factors": dict(self.factors),
+                "difference_r": {c: r.r for c, r in self.diff_regressions.items()},
+                "r": {c: r.r for c, r in self.regressions.items()}}
+
+    def amplitudes(self, mixture: Spectrum, divisor: Spectrum) -> dict[str, float]:
+        r = _ratio(mixture, divisor)
+        centred, const = self._centred(r)
+        amp: dict[str, float] = {}
+        if const is not None:
+            amp[self.divisor_compound] = const
+        for c in self.differences:
+            amp[c] = float(self.diff_regressions[c].predict_x(self._difference(centred, c)))
+        if self.subtract:
+            amp[self.subtract] = r.value_at(self.wavelength) - sum(amp.values())
+        return amp
+
+    def predict(self, mixture: Spectrum, divisor: Spectrum) -> dict[str, float]:
+        if not self.regressions:
+            raise RuntimeError("not fitted")
+        amp = self.amplitudes(mixture, divisor)
+        return {c: float(self.regressions[c].predict_x(amp[c])) for c in self.compounds}
+
+    def to_dict(self) -> dict:
+        return {"type": "amplitude_centering", "wavelength": self.wavelength,
+                "compounds": self.compounds, "subtract": self.subtract,
+                "divisor_compound": self.divisor_compound,
+                "plateau": list(self.plateau) if self.plateau else None,
+                "differences": self.differences, "unified": self.unified,
+                "factors": self.factors,
+                "diff_regressions": {c: r.to_dict() for c, r in self.diff_regressions.items()},
+                "regressions": {c: r.to_dict() for c, r in self.regressions.items()}}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AmplitudeCentering":
+        return cls(d["wavelength"], d["compounds"], d.get("subtract"), d.get("divisor_compound"),
+                   tuple(d["plateau"]) if d.get("plateau") else None, d.get("differences", {}),
+                   d.get("unified", False), d.get("factors", {}),
+                   {c: Regression.from_dict(r) for c, r in d.get("diff_regressions", {}).items()},
+                   {c: Regression.from_dict(r) for c, r in d.get("regressions", {}).items()})
+
+
+@dataclass
+class AbsorptionFactorMethod:
+    """Successive absorption (amplitude) factor method — MAFM for ternary
+    mixtures and the absorption factor method for binary ones.
+
+    ``order`` lists ``(compound, λ)`` so that the first compound absorbs alone
+    at its λ, the second is overlapped only by the first at its λ, and so on.
+    For each compound k, F_k(λ) = A_k(λ)/A_k(λ_k) comes from its pure
+    standards. In the mixture, R_i = A(λ_i) − Σ_{k<i} F_k(λ_i)·R_k is the
+    absorbance of compound i alone at λ_i; its postulated absorbance at the
+    quantitation wavelength (``quant[i]``, default λ_i) is F_i(λq)·R_i, read
+    from compound i's calibration at λq.
+    """
+
+    order: list[tuple[str, float]]
+    quant: dict[str, float] = field(default_factory=dict)
+    factors: dict[str, dict[str, float]] = field(default_factory=dict)
+    regressions: dict[str, Regression] = field(default_factory=dict)
+
+    def _lam(self, c: str) -> float:
+        return self.quant.get(c) or dict(self.order)[c]
+
+    def fit(self, standards: dict[str, list[Spectrum]]) -> dict:
+        names = [c for c, _ in self.order]
+        if len(set(names)) != len(names):
+            raise ValueError("each compound may appear once")
+        lams = [w for _, w in self.order]
+        for i, (c, w) in enumerate(self.order):
+            st = standards.get(c, [])
+            if len(st) < 3:
+                raise ValueError(f"check at least three pure {c} standards")
+            need = set(lams[i + 1:]) | {self._lam(c)}
+            self.factors[c] = {f"{lam:g}": float(np.mean([s.value_at(lam) / s.value_at(w)
+                                                          for s in st])) for lam in need}
+            self.regressions[c] = linear_regression([_conc(s, c) for s in st],
+                                                    [s.value_at(self._lam(c)) for s in st])
+        return {"factors": self.factors, "r": {c: r.r for c, r in self.regressions.items()}}
+
+    def predict(self, mixture: Spectrum) -> dict[str, float]:
+        if not self.regressions:
+            raise RuntimeError("not fitted")
+        resid: dict[str, float] = {}
+        out: dict[str, float] = {}
+        for c, w in self.order:
+            a = mixture.value_at(w) - sum(self.factors[k][f"{w:g}"] * r for k, r in resid.items())
+            resid[c] = a
+            out[c] = float(self.regressions[c].predict_x(self.factors[c][f"{self._lam(c):g}"] * a))
+        return out
+
+    def to_dict(self) -> dict:
+        return {"type": "absorption_factor", "order": [list(o) for o in self.order],
+                "quant": self.quant, "factors": self.factors,
+                "regressions": {c: r.to_dict() for c, r in self.regressions.items()}}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AbsorptionFactorMethod":
+        return cls([(c, float(w)) for c, w in d["order"]], d.get("quant", {}),
+                   d.get("factors", {}),
+                   {c: Regression.from_dict(r) for c, r in d.get("regressions", {}).items()})
+
+
+def enrichment_correction(found: float, added: float, claimed: float | None = None) -> dict:
+    """Sample enrichment (spiking or spectrum addition) of a minor component:
+    the amount added is subtracted from the amount found; % of the claimed
+    amount if given."""
+    net = float(found) - float(added)
+    out = {"found_total": float(found), "added": float(added), "found": net}
+    if claimed:
+        out["percent_of_claimed"] = 100 * net / claimed
+    return out
+
+
 def equal_amplitude_wavelengths(s: Spectrum, wavelength: float, start: float | None = None,
                                 end: float | None = None) -> list[float]:
     """Wavelengths where ``s`` has the same value as at ``wavelength`` (for
@@ -544,6 +825,10 @@ def standard_addition_recovery(predict, spectra: list[Spectrum], added: list[flo
     return out
 
 
+# derivative orders are a choice of method, not a parameter to vary by ±1
+_NOT_VARIED = {"order", "derivative_order", "divisor_derivative"}
+
+
 def numeric_parameters(method: UnivariateMethod) -> list[dict]:
     """Parameters of a method that can be varied in a robustness study."""
     from spectro.core.operations import REGISTRY
@@ -553,6 +838,8 @@ def numeric_parameters(method: UnivariateMethod) -> list[dict]:
         op = REGISTRY[st["op"]]
         for p in op.params:
             v = st.get("params", {}).get(p.name, p.default)
+            if p.name in _NOT_VARIED:
+                continue
             if p.kind in ("wavelength", "float", "int") and v is not None:
                 delta = 1.0 if p.kind in ("wavelength", "int") else abs(v) * 0.05 or 0.1
                 out.append({"path": ("steps", i, p.name), "label": f"{op.label}: {p.label}",

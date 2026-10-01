@@ -13,8 +13,8 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QF
                                QGroupBox,
                                QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
                                QListWidgetItem, QPlainTextEdit, QPushButton, QScrollArea,
-                               QSpinBox, QSplitter, QTableWidget, QTabWidget, QVBoxLayout,
-                               QWidget)
+                               QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget,
+                               QVBoxLayout, QWidget)
 
 from spectro.core import univariate as uv
 from spectro.core.multicomponent import (MODEL_TYPES, SignalEquations, SpectralModel, ga_select,
@@ -138,10 +138,20 @@ class UnivariateDialog(Base):
         self.template.currentTextChanged.connect(self._template)
         self.name = QLineEdit()
         self.origin = QCheckBox("Force through origin")
+        self.direct = QCheckBox("Concentration value: signal = concentration (no regression)")
+        self.direct.setToolTip("For a plateau of a ratio spectrum made with a unit-concentration "
+                               "(normalized) divisor. The calibration line is still reported.")
+        self.spike = QDoubleSpinBox()
+        self.spike.setRange(0, 1e6)
+        self.spike.setDecimals(4)
+        self.spike.setToolTip("Sample enrichment (spiking / spectrum addition): this amount is "
+                              "subtracted from each found value (Found − added column).")
         f.addRow("Compound", self.compound)
         f.addRow("Method", self.template)
         f.addRow("Name", self.name)
         f.addRow("", self.origin)
+        f.addRow("", self.direct)
+        f.addRow("Enrichment added", self.spike)
         ll.addLayout(f)
         g = QGroupBox("1. Processing steps")
         gl = QVBoxLayout(g)
@@ -223,6 +233,7 @@ class UnivariateDialog(Base):
             return
         self.pipe.set_steps(t["steps"])
         self.meas.set(t["measurement"])
+        self.direct.setChecked(bool(t.get("direct")))
         self.name.setText(f"{name} — {self.compound.currentText()}")
         needs = [s for s in t["steps"] for k, v in s["params"].items() if v is None]
         if needs:
@@ -231,7 +242,8 @@ class UnivariateDialog(Base):
     def _current(self) -> uv.UnivariateMethod:
         return uv.UnivariateMethod(self.name.text().strip() or "Univariate method",
                                    self.compound.currentText().strip(), self.pipe.get_steps(),
-                                   self.meas.get(), self.origin.isChecked())
+                                   self.meas.get(), self.origin.isChecked(),
+                                   direct=self.direct.isChecked())
 
     def _preview(self):
         ids = self.cal.checked_ids()[:30] or self.test.checked_ids()[:30]
@@ -298,7 +310,7 @@ class UnivariateDialog(Base):
             for s in self.project.spectra(ids):
                 sig = self.method.signal(s, self.project.resolver())
                 signals.append(sig)
-                found.append(float(self.method.regression.predict_x(sig)))
+                found.append(self.method.concentration(sig))
                 names.append(s.name)
                 taken.append(s.concentrations.get(comp))
         except Exception as exc:
@@ -307,11 +319,19 @@ class UnivariateDialog(Base):
         rows, recs = results_rows(names, found, taken)
         for r, sig in zip(rows, signals):
             r.insert(1, float(sig))
-        fill_table(self.results, ["Spectrum", "Signal", f"Found ({comp})", "Taken", "Recovery %"],
-                   rows)
+        headers = ["Spectrum", "Signal", f"Found ({comp})", "Taken", "Recovery %"]
+        spike = self.spike.value()
+        if spike:
+            headers.append(f"Found − added ({spike:g})")
+            for r, f in zip(rows, found):
+                r.append(uv.enrichment_correction(f, spike)["found"])
+        fill_table(self.results, headers, rows)
         self.summary.setText(summary_text(recs))
         self.predictions = {"ids": ids, "names": names, "found": found, "taken": taken,
                             "signals": signals, "recovery": recs}
+        if spike:
+            self.predictions["enrichment_added"] = spike
+            self.predictions["found_minus_added"] = [f - spike for f in found]
         self.last = (self.method.name, "univariate",
                      {"method": self.method.to_dict(), "compounds": [comp],
                       "found": [[f] for f in found], **{k: v for k, v in self.predictions.items()
@@ -998,6 +1018,244 @@ class SpecialDialog(Base):
         method, data = self.last
         self.project.save_result(method, "binary", data, self.win.current_trial(),
                                  inputs=data.get("ids"))
+
+
+# --------------------------------------------------------------------------- #
+# Progressive resolution (amplitude centering, absorption factor)
+# --------------------------------------------------------------------------- #
+def pure_standards(spectra, compounds: list[str]) -> dict[str, list]:
+    """Group pure standards by their single non-zero concentration."""
+    out: dict[str, list] = {c: [] for c in compounds}
+    for s in spectra:
+        nz = [c for c, v in s.concentrations.items() if v]
+        if len(nz) == 1 and nz[0] in out:
+            out[nz[0]].append(s)
+    return out
+
+
+def _cell(t: QTableWidget, i: int, j: int) -> str:
+    it = t.item(i, j)
+    return it.text().strip() if it is not None else ""
+
+
+def _num_cell(t: QTableWidget, i: int, j: int) -> float | None:
+    v = _cell(t, i, j).replace(",", ".")
+    if not v:
+        return None
+    try:
+        return float(v)
+    except ValueError:
+        raise ValueError(f"row {i + 1}: '{v}' is not a number") from None
+
+
+class ProgressiveDialog(Base):
+    """Ternary (and binary) progressive methods that resolve several compounds
+    from one ratio spectrum or a chain of absorbance factors."""
+
+    def __init__(self, win):
+        super().__init__(win, "Progressive resolution (AAC, MACM, RIDSS, CV-AD, MAFM)")
+        self.resize(1300, 860)
+        self.comps = self.project.compound_names()
+        self.last = None
+        tabs = QTabWidget()
+        tabs.addTab(self._ac_tab(), "Amplitude centering (one divisor, one λ)")
+        tabs.addTab(self._af_tab(), "Absorption factor (successive)")
+        lay = QVBoxLayout(self)
+        lay.addWidget(tabs, 1)
+        self.results = PasteTable()
+        self.summary = QLabel()
+        self.summary.setWordWrap(True)
+        lay.addWidget(QLabel("<b>Results</b>"))
+        lay.addWidget(self.results, 1)
+        lay.addWidget(self.summary)
+        row = QHBoxLayout()
+        save = QPushButton("Save results")
+        save.clicked.connect(self._save)
+        row.addStretch(1)
+        row.addWidget(save)
+        lay.addLayout(row)
+
+    def _lists(self):
+        recs = self.project.records()
+        std, mix = SpectrumChecklist(), SpectrumChecklist()
+        std.populate(recs, {r.id for r in recs if r.kind == "raw" and r.role in CAL_ROLES})
+        mix.populate(recs, {r.id for r in recs if r.kind == "raw" and r.role in TEST_ROLES})
+        return std, mix
+
+    def _optional_combo(self, none_label="(none)") -> QComboBox:
+        c = QComboBox()
+        c.addItem(none_label)
+        c.addItems(self.comps)
+        return c
+
+    def _ac_tab(self):
+        w = QWidget()
+        h = QHBoxLayout(w)
+        f = QFormLayout()
+        self.ac_comps = CompoundChecks(self.comps)
+        self.ac_div = QComboBox()
+        for sid, label in spectrum_choices(self.project)():
+            self.ac_div.addItem(label, sid)
+        self.ac_divc = self._optional_combo()
+        self.ac_w = wl_spin(275.5)
+        self.ac_plateau = QCheckBox("Plateau of the divisor compound")
+        self.ac_p1, self.ac_p2 = wl_spin(350), wl_spin(380)
+        self.ac_diff = PasteTable(4, 4)
+        self.ac_diff.setHorizontalHeaderLabels(["Compound", "λ1", "λ2", "Factor from"])
+        self.ac_diff.setToolTip("One row per compound found by amplitude difference: "
+                                "P(λ1) − F·P(λ2) of the ratio spectrum, where the others cancel. "
+                                "'Factor from' = the interferent whose equality factor "
+                                "F = P(λ1)/P(λ2) is used (blank: F = 1).")
+        self.ac_diff.setMaximumHeight(150)
+        self.ac_sub = self._optional_combo()
+        self.ac_unified = QCheckBox("Unified regression at λc (isoabsorptive point)")
+        info = QLabel("Ratio spectrum = mixture ÷ divisor. Plateau → divisor compound; "
+                      "λ pairs → postulated amplitudes at λc; the remaining compound by "
+                      "amplitude subtraction at λc. Pure standards are grouped by their "
+                      "single non-zero concentration.")
+        info.setWordWrap(True)
+        run = QPushButton("Calculate")
+        run.clicked.connect(self._run_ac)
+        for label, wid in (("Compounds", self.ac_comps), ("Divisor spectrum", self.ac_div),
+                           ("Divisor compound", self.ac_divc), ("Common λc", self.ac_w),
+                           ("", self.ac_plateau), ("Plateau from", self.ac_p1),
+                           ("Plateau to", self.ac_p2), ("Amplitude differences", self.ac_diff),
+                           ("Amplitude subtraction for", self.ac_sub), ("", self.ac_unified),
+                           ("", info), ("", run)):
+            f.addRow(label, wid)
+        fw = QWidget()
+        fw.setLayout(f)
+        h.addWidget(scroll(fw), 2)
+        self.ac_std, self.ac_mix = self._lists()
+        h.addWidget(list_box("Pure standards", self.ac_std), 1)
+        h.addWidget(list_box("Mixtures / samples", self.ac_mix), 1)
+        return w
+
+    def _ac_method(self) -> uv.AmplitudeCentering:
+        comps = self.ac_comps.checked()
+        diffs = {}
+        for i in range(self.ac_diff.rowCount()):
+            c = _cell(self.ac_diff, i, 0)
+            if not c:
+                continue
+            if c not in comps:
+                raise ValueError(f"row {i + 1}: '{c}' is not one of the checked compounds")
+            w1, w2 = _num_cell(self.ac_diff, i, 1), _num_cell(self.ac_diff, i, 2)
+            if w1 is None or w2 is None:
+                raise ValueError(f"row {i + 1}: give λ1 and λ2")
+            src = _cell(self.ac_diff, i, 3) or None
+            diffs[c] = {"w1": w1, "w2": w2, "factor_from": src}
+        divc = self.ac_divc.currentText() if self.ac_divc.currentIndex() > 0 else None
+        sub = self.ac_sub.currentText() if self.ac_sub.currentIndex() > 0 else None
+        return uv.AmplitudeCentering(
+            self.ac_w.value(), comps, sub, divc,
+            (self.ac_p1.value(), self.ac_p2.value()) if self.ac_plateau.isChecked() else None,
+            diffs, self.ac_unified.isChecked())
+
+    def _run_ac(self):
+        try:
+            m = self._ac_method()
+            div = self.project.spectrum(self.ac_div.currentData())
+            std = pure_standards(self.project.spectra(self.ac_std.checked_ids()), m.compounds)
+            info = m.fit(std, div)
+            mixes = self.project.spectra(self.ac_mix.checked_ids())
+            out = [(s, m.predict(s, div)) for s in mixes]
+        except Exception as exc:
+            error(self, exc)
+            return
+        lines = [f"{c}: calibration at λc r = {r:.5f}" for c, r in info["r"].items()]
+        lines += [f"{c}: amplitude-difference line r = {r:.5f}"
+                  for c, r in info["difference_r"].items()]
+        lines += [f"Equality factor for {c}: {f:.5g}" for c, f in info["factors"].items()]
+        self._show("Amplitude centering", m.compounds, out,
+                   {**m.to_dict(), "divisor": self.ac_div.currentData()}, lines)
+
+    def _af_tab(self):
+        w = QWidget()
+        h = QHBoxLayout(w)
+        f = QFormLayout()
+        self.af_table = PasteTable(4, 3)
+        self.af_table.setHorizontalHeaderLabels(["Compound (in order)", "λ where it is added",
+                                                 "Quantitation λ (optional)"])
+        self.af_table.setToolTip("Row 1: compound absorbing ALONE at its λ; row 2: compound "
+                                 "overlapped only by row 1 at its λ; row 3: all overlap.")
+        for i, c in enumerate(self.comps[:3]):
+            self.af_table.setItem(i, 0, QTableWidgetItem(c))
+        info = QLabel("Modified absorption factor method: absorption factors F = A(λ)/A(λk) "
+                      "of each pure compound remove its contribution at the following "
+                      "wavelengths; each compound is read from its own calibration.")
+        info.setWordWrap(True)
+        run = QPushButton("Calculate")
+        run.clicked.connect(self._run_af)
+        f.addRow("Order and wavelengths", self.af_table)
+        f.addRow("", info)
+        f.addRow("", run)
+        fw = QWidget()
+        fw.setLayout(f)
+        h.addWidget(fw, 2)
+        self.af_std, self.af_mix = self._lists()
+        h.addWidget(list_box("Pure standards", self.af_std), 1)
+        h.addWidget(list_box("Mixtures / samples", self.af_mix), 1)
+        return w
+
+    def _run_af(self):
+        try:
+            order, quant = [], {}
+            for i in range(self.af_table.rowCount()):
+                c = _cell(self.af_table, i, 0)
+                if not c:
+                    continue
+                lam = _num_cell(self.af_table, i, 1)
+                if lam is None:
+                    raise ValueError(f"row {i + 1}: give the wavelength")
+                order.append((c, lam))
+                q = _num_cell(self.af_table, i, 2)
+                if q is not None:
+                    quant[c] = q
+            m = uv.AbsorptionFactorMethod(order, quant)
+            comps = [c for c, _ in order]
+            info = m.fit(pure_standards(self.project.spectra(self.af_std.checked_ids()), comps))
+            out = [(s, m.predict(s)) for s in self.project.spectra(self.af_mix.checked_ids())]
+        except Exception as exc:
+            error(self, exc)
+            return
+        lines = [f"{c}: calibration r = {r:.5f}" for c, r in info["r"].items()]
+        lines += [f"Factors of {c}: " + ", ".join(f"F({k} nm) = {v:.4f}" for k, v in fs.items())
+                  for c, fs in info["factors"].items()]
+        self._show("Absorption factor method", comps, out, m.to_dict(), lines)
+
+    def _show(self, method: str, comps: list[str], out, params: dict, lines: list[str]):
+        rows, recs = [], {c: [] for c in comps}
+        for s, r in out:
+            row = [s.name]
+            for c in comps:
+                t = s.concentrations.get(c)
+                rec = 100 * r[c] / t if t else None
+                if rec is not None:
+                    recs[c].append(rec)
+                row += [r[c], "" if t is None else t, "" if rec is None else rec]
+            rows.append(row)
+        fill_table(self.results, ["Spectrum"] + [h for c in comps for h in
+                                                 (f"{c} found", f"{c} taken", f"{c} rec %")],
+                   rows)
+        lines = lines + [f"{c}: " + summary_text(v) for c, v in recs.items() if len(v) > 1]
+        self.summary.setText("\n".join(lines))
+        self.results.export_title = method
+        self.results.export_notes = lines
+        ids = [s.metadata.get("id") for s, _ in out]
+        self.last = (method, {"ids": ids, "compounds": comps, "params": params,
+                              "found": [[r[c] for c in comps] for _, r in out]})
+        self.project.log("CALCULATE", f"{method}: determined {', '.join(comps)} in "
+                                      f"{len(out)} spectra", {"inputs": ids, "params": params})
+
+    def _save(self):
+        if not self.last:
+            error(self, "Calculate first.")
+            return
+        method, data = self.last
+        self.project.save_result(method, "progressive", data, self.win.current_trial(),
+                                 inputs=data.get("ids"))
+        self.win.statusBar().showMessage("Results saved.")
 
 
 # --------------------------------------------------------------------------- #

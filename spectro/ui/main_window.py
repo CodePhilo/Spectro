@@ -200,6 +200,9 @@ class MainWindow(QMainWindow):
         act(m, "&Univariate calibration (all single-signal methods)…", self.univariate, "Ctrl+U")
         act(m, "&Equation methods (Vierordt, bivariate, AUC, multi-λ)…", self.equations)
         act(m, "&Binary special methods (Q-analysis, AS, AM, HPSAM)…", self.special)
+        act(m, "&Progressive resolution (AAC, MACM, RIDSS, CV-AD, MAFM)…", self.progressive,
+            tip="Ternary methods that resolve every compound from one ratio spectrum or a "
+                "chain of absorption factors")
         act(m, "&Chemometrics (CLS, ILS, PCR, PLS, MCR-ALS, ANN, SVR)…", self.chemometrics,
             "Ctrl+M")
         act(m, "Saved methods && results…", self.saved)
@@ -588,6 +591,9 @@ class MainWindow(QMainWindow):
 
     def special(self):
         self._dialog("dialogs_methods", "SpecialDialog")
+
+    def progressive(self):
+        self._dialog("dialogs_methods", "ProgressiveDialog")
 
     def chemometrics(self):
         self._dialog("dialogs_methods", "ChemometricsDialog")
