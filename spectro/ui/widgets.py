@@ -477,7 +477,7 @@ class SpectrumPlot(pg.PlotWidget):
             ln = pg.InfiniteLine(pos=x, angle=90, movable=movable,
                                  pen=pg.mkPen(colour, width=2),
                                  label=key, labelOpts={"position": 0.95, "color": colour})
-            ln.sigPositionChangeFinished.connect(lambda l, k=key: self.line_moved.emit(k, l.value()))
+            ln.sigPositionChangeFinished.connect(lambda line, k=key: self.line_moved.emit(k, line.value()))
             self.addItem(ln)
             self.vlines[key] = ln
         else:

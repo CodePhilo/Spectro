@@ -38,6 +38,7 @@ from typing import Any
 
 import numpy as np
 
+from spectro.core.catalog import CATEGORIES
 from spectro.core.operations import Param, Resolver, _on_grid, apply_pipeline
 from spectro.core.spectrum import Spectrum
 from spectro.core.validation import Regression, linear_regression
@@ -269,11 +270,11 @@ TEMPLATES: dict[str, dict[str, Any]] = {
                   {"op": "ratio_subtraction",
                    "params": {"divisor": None, "start": 290.0, "end": 310.0}}],
         "measurement": {"kind": "amplitude", "params": {"w1": 245.0}}},
-    "Ratio subtraction (X)": {
+    "Ratio subtraction / spectrum subtraction (X)": {
         "steps": [{"op": "ratio_subtraction", "params": {"divisor": None, "start": 300.0,
                                                           "end": 320.0}}],
         "measurement": {"kind": "amplitude", "params": {"w1": 260.0}}},
-    "Constant multiplication (Y)": {
+    "Constant multiplication / SS-CM (extended Y)": {
         "steps": [{"op": "constant_multiplication",
                    "params": {"divisor": None, "start": 300.0, "end": 320.0}}],
         "measurement": {"kind": "amplitude", "params": {"w1": 260.0}}},
@@ -295,10 +296,7 @@ TEMPLATES: dict[str, dict[str, Any]] = {
                    "params": {"divisor": None, "reference": None, "w1": 230.0,
                               "w2": 260.0, "target": "X"}}],
         "measurement": {"kind": "amplitude", "params": {"w1": 260.0}}},
-    "Spectrum subtraction–constant multiplication (SS-CM, Y)": {
-        "steps": [{"op": "constant_multiplication",
-                   "params": {"divisor": None, "start": 300.0, "end": 320.0}}],
-        "measurement": {"kind": "amplitude", "params": {"w1": 290.0}}},
+
     "Derivative subtraction (DS, X in D1)": {
         "steps": [_D1, {"op": "ratio_subtraction",
                         "params": {"divisor": None, "start": 300.0, "end": 320.0,
@@ -328,9 +326,7 @@ TEMPLATES: dict[str, dict[str, Any]] = {
                               "end": 275.0}},
                   {"op": "mean_center", "params": {"start": 215.0, "end": 275.0}}],
         "measurement": {"kind": "amplitude", "params": {"w1": 250.0}}},
-    "Ratio difference with normalized divisor": {
-        "steps": [{"op": "divide", "params": {"reference": None}}],
-        "measurement": {"kind": "difference", "params": {"w1": 264.0, "w2": 225.0}}},
+
     "Derivative transformation (DT, recover zero order)": {
         "steps": [{"op": "factorized_recovery",
                    "params": {"reference": None, "wavelength": 306.0, "wavelength_end": 313.0,
@@ -341,6 +337,51 @@ TEMPLATES: dict[str, dict[str, Any]] = {
         "measurement": {"kind": "mean", "params": {"w1": 330.0, "w2": 333.0}},
         "direct": True},
 }
+
+TEMPLATE_CATEGORIES: dict[str, str] = {
+    "Direct (zero order, λmax)": "zero_order",
+    "Dual wavelength": "zero_order",
+    "Induced dual wavelength": "zero_order",
+    "Area under curve (single component)": "zero_order",
+    "Zero-crossing derivative (D1)": "derivative",
+    "Zero-crossing derivative (D2)": "derivative",
+    "Derivative peak-to-peak": "derivative",
+    "Dual wavelength in derivative mode": "derivative",
+    "Derivative ratio (DD1)": "ratio_derivative",
+    "Mean centering of ratio spectra (MCR)": "ratio_derivative",
+    "Successive derivative ratio (ternary)": "ratio_derivative",
+    "Double divisor ratio derivative (ternary)": "ratio_derivative",
+    "Derivative ratio of D1 spectra (D1 DR)": "ratio_derivative",
+    "Mean centering of ratio spectra (ternary)": "ratio_derivative",
+    "Ratio difference (RD)": "ratio_amplitude",
+    "Dual amplitude difference (ternary)": "ratio_amplitude",
+    "Ratio plateau / constant value (Y)": "ratio_amplitude",
+    "Concentration value (unit divisor plateau, no regression)": "ratio_amplitude",
+    "Extended ratio subtraction (Y)": "resolution",
+    "Successive spectrum subtraction (ternary)": "resolution",
+    "Ratio subtraction / spectrum subtraction (X)": "resolution",
+    "Constant multiplication / SS-CM (extended Y)": "resolution",
+    "Spectrum subtraction": "resolution",
+    "Factorized zero-order (FZM)": "resolution",
+    "Constant center": "resolution",
+    "Derivative subtraction (DS, X in D1)": "resolution",
+    "Derivative subtraction–constant multiplication (DS-CM, Y in D1)": "resolution",
+    "Successive ratio subtraction (ternary SRS, Z)": "resolution",
+    "Derivative transformation (DT, recover zero order)": "resolution",
+}
+
+for _name, _t in TEMPLATES.items():
+    _t["category"] = TEMPLATE_CATEGORIES[_name]
+
+
+def templates_by_category() -> dict[str, list[str]]:
+    """Template names grouped by method family, in catalogue order."""
+    out: dict[str, list[str]] = {}
+    for key in CATEGORIES:
+        names = [n for n, t in TEMPLATES.items() if t["category"] == key]
+        if names:
+            out[key] = names
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -636,8 +677,8 @@ class AmplitudeCentering(_Progressive):
       λc − all the others (amplitude subtraction).
 
     Each amplitude at λc is converted to concentration with that compound's
-    regression at λc (or one *unified* regression when λc is an isoabsorptive
-    point). This one class covers advanced amplitude centering (AAC, partial
+    regression at λc (or one *unified* regression for the non-divisor compounds
+    when λc is their isoabsorptive point; the divisor compound keeps its own). This one class covers advanced amplitude centering (AAC, partial
     and complete overlap), the modified amplitude center method (MACM),
     ratio difference–isoabsorptive (RIDSS) and constant value via amplitude
     difference (CV-AD), and amplitude modulation as the binary special case.
@@ -713,18 +754,20 @@ class AmplitudeCentering(_Progressive):
             self.diff_regressions[c] = linear_regression(
                 [r.value_at(self.wavelength) for r in ratios[c]],
                 [self._difference(self._centred(r)[0], c) for r in ratios[c]])
+        self.regressions = {c: linear_regression([_conc(s, c) for s in standards[c]],
+                                                 [r.value_at(self.wavelength)
+                                                  for r in ratios[c]])
+                            for c in self.compounds}
         if self.unified:
+            # one line for the compounds sharing the isoabsorptive point λc; the
+            # divisor compound (a constant in the ratio spectrum) keeps its own
+            pooled = [c for c in self.compounds if c != self.divisor_compound]
             xs, ys = [], []
-            for c in self.compounds:
+            for c in pooled:
                 xs += [_conc(s, c) for s in standards[c]]
                 ys += [r.value_at(self.wavelength) for r in ratios[c]]
             reg = linear_regression(xs, ys)
-            self.regressions = {c: reg for c in self.compounds}
-        else:
-            self.regressions = {c: linear_regression([_conc(s, c) for s in standards[c]],
-                                                     [r.value_at(self.wavelength)
-                                                      for r in ratios[c]])
-                                for c in self.compounds}
+            self.regressions.update({c: reg for c in pooled})
         return {"factors": dict(self.factors),
                 "difference_r": {c: r.r for c, r in self.diff_regressions.items()},
                 "r": {c: r.r for c, r in self.regressions.items()}}

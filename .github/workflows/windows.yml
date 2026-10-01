@@ -23,7 +23,8 @@ jobs:
         run: >
           python -m PyInstaller --noconfirm --windowed --name Spectro
           --collect-submodules sklearn --collect-data sklearn --collect-data spectro
-          --hidden-import scipy.special._cdflib run_spectro.py
+          --hidden-import scipy.special._cdflib --add-data "docs/methods;docs/methods"
+          run_spectro.py
       - name: Self-check frozen executable
         shell: pwsh
         run: |

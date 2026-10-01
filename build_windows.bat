@@ -4,7 +4,7 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt pyinstaller
 python -m PyInstaller --noconfirm --windowed --name Spectro ^
   --collect-submodules sklearn --collect-data sklearn --collect-data spectro ^
-  --hidden-import scipy.special._cdflib ^
+  --hidden-import scipy.special._cdflib --add-data "docs/methods;docs/methods" ^
   run_spectro.py
 echo.
 echo Built: dist\Spectro\Spectro.exe

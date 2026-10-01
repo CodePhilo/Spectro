@@ -256,6 +256,21 @@ def _valid_region(grid, div_u, frac=0.05):
     return float(grid[best[0]]), float(grid[best[1] - 1])
 
 
+def _valid_regions(grid, div_u, frac=0.05, min_width=20.0):
+    """All contiguous regions (≥ min_width nm) where the divisor is ≥ frac of
+    its maximum — a divisor with two bands has two usable regions."""
+    ok = div_u >= frac * np.max(div_u)
+    out, start = [], None
+    for i, v in enumerate(np.append(ok, False)):
+        if v and start is None:
+            start = i
+        elif not v and start is not None:
+            if grid[i - 1] - grid[start] >= min_width:
+                out.append((float(grid[start]), float(grid[i - 1])))
+            start = None
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Screening
 # --------------------------------------------------------------------------- #
@@ -707,60 +722,80 @@ class _ProgressiveScreen:
                 continue
             div = self.sc.resolve(DIV + z)
             dv = np.interp(self.grid, div.wavelengths, div.values)
-            region = _valid_region(self.grid, dv, 0.05)
-            if region is None:
-                continue
-            keep = (self.grid >= region[0]) & (self.grid <= region[1])
-            g = self.grid[keep]
-            R = {c: Spectrum(g, self.units[c][keep] / dv[keep]) for c in others}
-            lam = self._lambdas(*region)
-            # complete overlap
-            for lc in lam:
-                diffs = {}
-                for x in others:
-                    rest = [y for y in others if y != x]
-                    if rest:
-                        cands = [w for w in equal_amplitude_wavelengths(R[rest[0]], lc,
-                                                                         region[0] + 2,
-                                                                         region[1] - 2)
-                                 if abs(w - lc) >= 4]
-                    else:
-                        cands = list(self._lambdas(*region, step=2.0))
-                    if not cands:
-                        break
-                    w2 = max(cands, key=lambda w: abs(R[x].value_at(lc) - R[x].value_at(w)))
-                    diffs[x] = {"w1": float(lc), "w2": float(w2)}
-                else:
-                    out.append((AmplitudeCentering(float(lc), list(self.comps), subtract=z,
-                                                   divisor_compound=z, differences=diffs), z))
-            # plateau of the divisor compound
             pl = _plateau(self.grid, sum(np.abs(self.units[c]) for c in others), self.units[z])
-            if pl is None or pl[0] < region[0] or pl[1] > region[1]:
+            segments = _valid_regions(self.grid, dv, 0.05)
+            if segments:
+                out += self._centering(z, others, dv, segments, pl)
+        return out
+
+    def _centering(self, z, others, dv, segments, pl):
+        """Every wavelength used (λc, partners, plateau) must lie where the
+        divisor is usable; equal-amplitude partners are searched within the
+        segment of λc (the ratio is meaningless across a divisor gap)."""
+        out = []
+        R = {c: Spectrum(self.grid, np.where(np.abs(dv) > 1e-12,
+                                             self.units[c] / np.where(dv == 0, 1, dv), 0.0))
+             for c in others}
+        seg_of = {}
+        lams = []
+        for seg in segments:
+            for lc in self._lambdas(*seg):
+                seg_of[float(lc)] = seg
+                lams.append(float(lc))
+        valid = [float(w) for seg in segments for w in self._lambdas(*seg, step=2.0)]
+        big = {c: 0.05 * max(abs(R[c].value_at(w)) for w in valid) for c in others}
+
+        def strong(c, lam):          # c's ratio amplitude at λ is usable
+            return abs(R[c].value_at(lam)) >= big[c]
+        # complete overlap (MACM / AAC-complete / CV-AD)
+        for lc in lams:
+            lo, hi = seg_of[lc]
+            options = []            # per compound: up to two partner wavelengths
+            for x in others:
+                rest = [y for y in others if y != x]
+                if not strong(x, lc):
+                    break
+                if rest:
+                    r = R[rest[0]]
+                    seg_spec = Spectrum(*r.region(lo, hi))
+                    cands = [w for w in equal_amplitude_wavelengths(seg_spec, lc, lo + 2, hi - 2)
+                             if abs(w - lc) >= 4]
+                else:
+                    cands = [w for w in self._lambdas(lo, hi, step=2.0) if abs(w - lc) >= 4]
+                if not cands:
+                    break
+                cands.sort(key=lambda w: -abs(R[x].value_at(lc) - R[x].value_at(w)))
+                options.append([(x, float(w)) for w in cands[:2]])
+            else:
+                for combo in itertools.product(*options):
+                    diffs = {x: {"w1": lc, "w2": w} for x, w in combo}
+                    out.append((AmplitudeCentering(lc, list(self.comps), subtract=z,
+                                                   divisor_compound=z, differences=diffs), z))
+        # plateau of the divisor compound (AAC-partial / RIDSS / AM)
+        if pl is None or not any(a <= pl[0] and pl[1] <= b for a, b in segments):
+            return out
+        for lc in lams:
+            if lc >= pl[0] - 2:
                 continue
-            for lc in lam:
-                if lc >= pl[0] - 2:
+            if len(others) == 1:
+                if strong(others[0], lc):
+                    out.append((AmplitudeCentering(lc, list(self.comps), subtract=others[0],
+                                                   divisor_compound=z, plateau=pl), z))
+                continue
+            for a, b in (others, others[::-1]):
+                if not (strong(a, lc) and strong(b, lc)):
                     continue
-                if len(others) == 1:
-                    out.append((AmplitudeCentering(float(lc), list(self.comps),
-                                                   subtract=others[0], divisor_compound=z,
-                                                   plateau=pl), z))
-                    continue
-                for a, b in (others, others[::-1]):
-                    best, w2 = 0.0, None
-                    for w in self._lambdas(region[0], pl[0], step=2.0):
-                        if abs(w - lc) < 4 or abs(R[b].value_at(w)) < 1e-12:
-                            continue
-                        f = R[b].value_at(lc) / R[b].value_at(w)
-                        if abs(f) > 20:
-                            continue
-                        d = abs(R[a].value_at(lc) - f * R[a].value_at(w))
-                        if d > best:
-                            best, w2 = d, w
-                    if w2 is not None:
-                        out.append((AmplitudeCentering(
-                            float(lc), list(self.comps), subtract=b, divisor_compound=z,
-                            plateau=pl, differences={a: {"w1": float(lc), "w2": float(w2),
-                                                         "factor_from": b}}), z))
+                cands = []
+                for w in valid:
+                    if abs(w - lc) < 4 or w >= pl[0] - 2 or not strong(b, w):
+                        continue
+                    f = R[b].value_at(lc) / R[b].value_at(w)
+                    if abs(f) <= 20:
+                        cands.append((abs(R[a].value_at(lc) - f * R[a].value_at(w)), w))
+                for _, w2 in sorted(cands, reverse=True)[:2]:
+                    out.append((AmplitudeCentering(
+                        lc, list(self.comps), subtract=b, divisor_compound=z, plateau=pl,
+                        differences={a: {"w1": lc, "w2": float(w2), "factor_from": b}}), z))
         return out
 
     def absorption_factor(self) -> list[AbsorptionFactorMethod]:

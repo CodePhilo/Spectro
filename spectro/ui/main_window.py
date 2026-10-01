@@ -197,15 +197,21 @@ class MainWindow(QMainWindow):
             tip="Smoothing, baseline, derivatives, ratio spectra, resolution…")
 
         m = mb.addMenu("&Methods")
-        act(m, "&Univariate calibration (all single-signal methods)…", self.univariate, "Ctrl+U")
+        m.addSection("One compound per method")
+        act(m, "&Univariate calibration — zero order, derivative, ratio, spectrum "
+               "resolution (29 templates)…", self.univariate, "Ctrl+U")
+        m.addSection("All compounds at once")
         act(m, "&Equation methods (Vierordt, bivariate, AUC, multi-λ)…", self.equations)
-        act(m, "&Binary special methods (Q-analysis, AS, AM, HPSAM)…", self.special)
+        act(m, "&Binary two-signal methods (Q, AS, AAS, AM, IAM, HPSAM)…", self.special)
         act(m, "&Progressive resolution (AAC, MACM, RIDSS, CV-AD, MAFM)…", self.progressive,
             tip="Ternary methods that resolve every compound from one ratio spectrum or a "
                 "chain of absorption factors")
         act(m, "&Chemometrics (CLS, ILS, PCR, PLS, MCR-ALS, ANN, SVR)…", self.chemometrics,
             "Ctrl+M")
+        m.addSeparator()
         act(m, "Saved methods && results…", self.saved)
+        act(m, "Method &guide (how to apply each method)…", self.method_guide, needs_project=False,
+            tip="Open the illustrated guide to every method")
 
         m = mb.addMenu("&Tools")
         act(m, "&Method optimizer (find the best processing)…", self.optimizer, "Ctrl+Shift+O",
@@ -591,6 +597,18 @@ class MainWindow(QMainWindow):
 
     def special(self):
         self._dialog("dialogs_methods", "SpecialDialog")
+
+    def method_guide(self):
+        """Open docs/methods/index.html (source checkout or bundled data)."""
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[2]))
+        here = base / "docs" / "methods" / "index.html"
+        if not here.exists():
+            QMessageBox.information(self, "Method guide", "The guide is in docs/methods of the "
+                                    "Spectro source (README.md / index.html).")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(here)))
 
     def progressive(self):
         self._dialog("dialogs_methods", "ProgressiveDialog")

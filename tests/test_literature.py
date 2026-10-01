@@ -485,14 +485,16 @@ def test_ridss_am14():
                               differences={"Y": {"w1": lam, "w2": wx}})
     m.fit(TER_STD, Z24)
     _check("RIDSS", lambda s: m.predict(s, Z24), tol=0.2)
-    # the unified regression at the isoabsorptive point gives the same answer
-    # for X and Y (they share one line there)
-    mu = uv.AmplitudeCentering(lam, ["X", "Y"], subtract="X", divisor_compound="Z",
+    # the unified regression pools X and Y (they share one line at their
+    # isoabsorptive point); Z, the divisor compound, keeps its own line —
+    # pooling Z too gave ~124 % recoveries (bug found by the method guide)
+    mu = uv.AmplitudeCentering(lam, ["X", "Y", "Z"], subtract="X", divisor_compound="Z",
                                plateau=(340.0, 380.0),
                                differences={"Y": {"w1": lam, "w2": wx}}, unified=True)
-    mu.compounds = ["X", "Y", "Z"]
-    with pytest.raises(ValueError):
-        mu.fit({k: v for k, v in TER_STD.items() if k != "Z"}, Z24)
+    mu.fit(TER_STD, Z24)
+    assert mu.regressions["X"] is mu.regressions["Y"]
+    assert mu.regressions["Z"] is not mu.regressions["X"]
+    _check("RIDSS unified", lambda s: mu.predict(s, Z24), tol=0.2)
 
 
 def test_cv_ad_lo15():

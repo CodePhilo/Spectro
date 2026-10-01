@@ -82,6 +82,23 @@ def checklists(project, compound: str | None = None, cal_roles=CAL_ROLES, test_r
     return cal, test
 
 
+def add_grouped(combo: QComboBox, groups: dict[str, list[str]]) -> None:
+    """Items under bold, non-selectable family headings."""
+    from PySide6.QtGui import QFont
+
+    from spectro.core.catalog import CATEGORIES
+    model = combo.model()
+    for key, names in groups.items():
+        combo.addItem(f"— {CATEGORIES.get(key, key)} —")
+        head = model.item(combo.count() - 1)
+        head.setEnabled(False)
+        f = QFont(head.font())
+        f.setBold(True)
+        head.setFont(f)
+        for n in names:
+            combo.addItem(n)
+
+
 def list_box(title: str, lst: SpectrumChecklist) -> QGroupBox:
     g = QGroupBox(title)
     v = QVBoxLayout(g)
@@ -134,7 +151,7 @@ class UnivariateDialog(Base):
         self.compound.setEditable(True)
         self.template = QComboBox()
         self.template.addItem("(choose a method template)")
-        self.template.addItems(list(uv.TEMPLATES))
+        add_grouped(self.template, uv.templates_by_category())
         self.template.currentTextChanged.connect(self._template)
         self.name = QLineEdit()
         self.origin = QCheckBox("Force through origin")
@@ -721,16 +738,19 @@ def wl_spin(v: float) -> QDoubleSpinBox:
 
 class SpecialDialog(Base):
     def __init__(self, win):
-        super().__init__(win, "Binary special methods")
+        super().__init__(win, "Binary two-signal methods")
         self.resize(1250, 800)
         self.comps = self.project.compound_names()
-        tabs = QTabWidget()
-        tabs.addTab(self._q_tab(), "Absorbance ratio (Q-analysis)")
-        tabs.addTab(self._as_tab(), "Absorbance subtraction")
-        tabs.addTab(self._am_tab(), "Amplitude modulation")
-        tabs.addTab(self._iam_tab(), "Induced amplitude modulation")
-        tabs.addTab(self._aas_tab(), "Advanced absorbance subtraction")
-        tabs.addTab(self._h_tab(), "H-point standard addition")
+        tabs = self.tabs = QTabWidget()
+        # zero-order spectra
+        tabs.addTab(self._q_tab(), "Zero order: Q-analysis")
+        tabs.addTab(self._as_tab(), "Zero order: absorbance subtraction")
+        tabs.addTab(self._aas_tab(), "Zero order: advanced absorbance subtraction")
+        # ratio spectra (amplitudes)
+        tabs.addTab(self._am_tab(), "Ratio: amplitude modulation")
+        tabs.addTab(self._iam_tab(), "Ratio: induced amplitude modulation")
+        # standard addition
+        tabs.addTab(self._h_tab(), "Standard addition: H-point (HPSAM)")
         lay = QVBoxLayout(self)
         lay.addWidget(tabs, 1)
         self.results = PasteTable()
@@ -1051,11 +1071,11 @@ class ProgressiveDialog(Base):
         self.comps = self.project.compound_names()
         self.last = None
         self.fitted = None          # (method, calibration ids) of the last calculation
-        tabs = QTabWidget()
-        tabs.addTab(self._ac_tab(), "Amplitude centering (one divisor, one λ)")
-        tabs.addTab(self._af_tab(), "Absorption factor (successive)")
+        tabs = self.tabs = QTabWidget()
+        tabs.addTab(self._ac_tab(), "Ratio: amplitude centering (AAC, MACM, RIDSS, CV-AD)")
+        tabs.addTab(self._af_tab(), "Zero order: successive absorption factor (MAFM)")
         lay = QVBoxLayout(self)
-        lay.addWidget(tabs, 1)
+        lay.addWidget(tabs, 3)
         self.results = PasteTable()
         self.summary = QLabel()
         self.summary.setWordWrap(True)
@@ -1107,6 +1127,7 @@ class ProgressiveDialog(Base):
                                 "P(λ1) − F·P(λ2) of the ratio spectrum, where the others cancel. "
                                 "'Factor from' = the interferent whose equality factor "
                                 "F = P(λ1)/P(λ2) is used (blank: F = 1).")
+        self.ac_diff.setMinimumHeight(130)
         self.ac_diff.setMaximumHeight(150)
         self.ac_sub = self._optional_combo()
         self.ac_unified = QCheckBox("Unified regression at λc (isoabsorptive point)")
@@ -1170,7 +1191,8 @@ class ProgressiveDialog(Base):
         lines = [f"{c}: calibration at λc r = {r:.5f}" for c, r in info["r"].items()]
         lines += [f"{c}: amplitude-difference line r = {r:.5f}"
                   for c, r in info["difference_r"].items()]
-        lines += [f"Equality factor for {c}: {f:.5g}" for c, f in info["factors"].items()]
+        lines += [f"Equality factor F of {m.differences[c]['factor_from']} (used for {c}): "
+                  f"{f:.5g}" for c, f in info["factors"].items()]
         self.fitted = (m, cal)
         self._show("Amplitude centering", m.compounds, out, m.to_dict(), lines)
 
