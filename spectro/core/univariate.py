@@ -579,8 +579,44 @@ def _conc(s: Spectrum, compound: str) -> float:
     return float(s.concentrations[compound])
 
 
+def pure_standards(spectra: list[Spectrum], compounds: list[str]) -> dict[str, list[Spectrum]]:
+    """Group pure standards by their single non-zero concentration."""
+    out: dict[str, list[Spectrum]] = {c: [] for c in compounds}
+    for s in spectra:
+        nz = [c for c, v in s.concentrations.items() if v]
+        if len(nz) == 1 and nz[0] in out:
+            out[nz[0]].append(s)
+    return out
+
+
+class _Progressive:
+    """Common interface of the progressive methods so they can be saved,
+    applied to new spectra, exported and ranked by the optimizer like any other
+    method: ``fit_spectra`` / ``predict_spectra`` take plain spectrum lists and
+    a resolver for the stored divisor reference."""
+
+    compounds: list[str]
+
+    @property
+    def is_fitted(self) -> bool:
+        return bool(self.regressions)
+
+    def _divisor(self, resolve: Resolver | None):
+        return None
+
+    def fit_spectra(self, spectra: list[Spectrum], resolve: Resolver | None = None) -> dict:
+        return self._fit(pure_standards(spectra, self.compounds), self._divisor(resolve))
+
+    def predict_spectra(self, spectra: list[Spectrum], resolve: Resolver | None = None
+                        ) -> np.ndarray:
+        div = self._divisor(resolve)
+        rows = [self._predict(s, div) for s in spectra]
+        return np.array([[r[c] for c in self.compounds] for r in rows], float).reshape(
+            len(rows), len(self.compounds))
+
+
 @dataclass
-class AmplitudeCentering:
+class AmplitudeCentering(_Progressive):
     """Progressive resolution on ONE ratio spectrum at ONE wavelength λc.
 
     The mixture is divided by one divisor (Z′, usually the normalised spectrum
@@ -617,6 +653,24 @@ class AmplitudeCentering:
     factors: dict[str, float] = field(default_factory=dict)
     diff_regressions: dict[str, Regression] = field(default_factory=dict)
     regressions: dict[str, Regression] = field(default_factory=dict)
+    divisor: Any = None        # stored reference of the divisor spectrum (saved methods)
+    name: str = ""
+
+    def _divisor(self, resolve: Resolver | None) -> Spectrum:
+        d = self.divisor
+        if d is None:
+            raise ValueError("the method has no divisor spectrum")
+        if isinstance(d, Spectrum):
+            return d
+        if resolve is None:
+            raise ValueError("no resolver for the divisor spectrum")
+        return resolve(d)
+
+    def _fit(self, standards, divisor):
+        return self.fit(standards, divisor)
+
+    def _predict(self, s, divisor):
+        return self.predict(s, divisor)
 
     def _check(self) -> None:
         known = set(self.differences) | ({self.subtract} if self.subtract else set())
@@ -701,19 +755,35 @@ class AmplitudeCentering:
                 "differences": self.differences, "unified": self.unified,
                 "factors": self.factors,
                 "diff_regressions": {c: r.to_dict() for c, r in self.diff_regressions.items()},
-                "regressions": {c: r.to_dict() for c, r in self.regressions.items()}}
+                "regressions": {c: r.to_dict() for c, r in self.regressions.items()},
+                "divisor": None if isinstance(self.divisor, Spectrum) else self.divisor,
+                "name": self.name}
 
     @classmethod
     def from_dict(cls, d: dict) -> "AmplitudeCentering":
         return cls(d["wavelength"], d["compounds"], d.get("subtract"), d.get("divisor_compound"),
-                   tuple(d["plateau"]) if d.get("plateau") else None, d.get("differences", {}),
-                   d.get("unified", False), d.get("factors", {}),
+                   tuple(d["plateau"]) if d.get("plateau") else None,
+                   copy.deepcopy(d.get("differences", {})),
+                   d.get("unified", False), dict(d.get("factors", {})),
                    {c: Regression.from_dict(r) for c, r in d.get("diff_regressions", {}).items()},
-                   {c: Regression.from_dict(r) for c, r in d.get("regressions", {}).items()})
+                   {c: Regression.from_dict(r) for c, r in d.get("regressions", {}).items()},
+                   d.get("divisor"), d.get("name", ""))
+
+    def describe(self) -> str:
+        parts = [f"÷ {self.divisor_compound or 'divisor'}, λc {self.wavelength:.1f} nm"]
+        if self.plateau:
+            parts.append(f"{self.divisor_compound} from plateau "
+                         f"{self.plateau[0]:.0f}–{self.plateau[1]:.0f} nm")
+        for c, d in self.differences.items():
+            f = f" − F({d['factor_from']})·" if d.get("factor_from") else " − "
+            parts.append(f"{c}: P{d['w1']:.1f}{f}P{d['w2']:.1f}")
+        if self.subtract:
+            parts.append(f"{self.subtract} by subtraction")
+        return "; ".join(parts)
 
 
 @dataclass
-class AbsorptionFactorMethod:
+class AbsorptionFactorMethod(_Progressive):
     """Successive absorption (amplitude) factor method — MAFM for ternary
     mixtures and the absorption factor method for binary ones.
 
@@ -730,6 +800,22 @@ class AbsorptionFactorMethod:
     quant: dict[str, float] = field(default_factory=dict)
     factors: dict[str, dict[str, float]] = field(default_factory=dict)
     regressions: dict[str, Regression] = field(default_factory=dict)
+    name: str = ""
+
+    @property
+    def compounds(self) -> list[str]:
+        return [c for c, _ in self.order]
+
+    def _fit(self, standards, divisor):
+        return self.fit(standards)
+
+    def _predict(self, s, divisor):
+        return self.predict(s)
+
+    def describe(self) -> str:
+        return " → ".join(f"{c} at {w:.1f} nm" + (f" (read at {self.quant[c]:.1f})"
+                                                   if self.quant.get(c) else "")
+                          for c, w in self.order)
 
     def _lam(self, c: str) -> float:
         return self.quant.get(c) or dict(self.order)[c]
@@ -763,14 +849,28 @@ class AbsorptionFactorMethod:
 
     def to_dict(self) -> dict:
         return {"type": "absorption_factor", "order": [list(o) for o in self.order],
-                "quant": self.quant, "factors": self.factors,
-                "regressions": {c: r.to_dict() for c, r in self.regressions.items()}}
+                "compounds": self.compounds, "quant": self.quant, "factors": self.factors,
+                "regressions": {c: r.to_dict() for c, r in self.regressions.items()},
+                "name": self.name}
 
     @classmethod
     def from_dict(cls, d: dict) -> "AbsorptionFactorMethod":
-        return cls([(c, float(w)) for c, w in d["order"]], d.get("quant", {}),
-                   d.get("factors", {}),
-                   {c: Regression.from_dict(r) for c, r in d.get("regressions", {}).items()})
+        return cls([(c, float(w)) for c, w in d["order"]], dict(d.get("quant", {})),
+                   copy.deepcopy(d.get("factors", {})),
+                   {c: Regression.from_dict(r) for c, r in d.get("regressions", {}).items()},
+                   d.get("name", ""))
+
+
+PROGRESSIVE_TYPES = {"amplitude_centering": AmplitudeCentering,
+                     "absorption_factor": AbsorptionFactorMethod}
+
+
+def progressive_from_dict(d: dict):
+    """A saved amplitude-centering or absorption-factor method."""
+    cls = PROGRESSIVE_TYPES.get(d.get("type"))
+    if cls is None:
+        raise ValueError(f"not a progressive method: {d.get('type')}")
+    return cls.from_dict(d)
 
 
 def enrichment_correction(found: float, added: float, claimed: float | None = None) -> dict:

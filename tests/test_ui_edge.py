@@ -5,6 +5,7 @@ import pytest
 
 pytest.importorskip("PySide6")
 
+from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from spectro.storage.project import Project  # noqa: E402
@@ -64,7 +65,7 @@ ACTIONS = {
                                         "_kaiser"],
     "dialogs_methods.SpecialDialog": ["_run_q", "_run_as", "_run_am", "_run_iam", "_run_aas",
                                       "_aas_find", "_run_h", "_save"],
-    "dialogs_methods.ProgressiveDialog": ["_run_ac", "_run_af", "_save"],
+    "dialogs_methods.ProgressiveDialog": ["_run_ac", "_run_af", "_save", "_save_method"],
     "dialogs_methods.ChemometricsDialog": ["_cv", "_fit", "_ipls", "_ga", "_save_method",
                                            "_save_results", "_exclude_outliers"],
     "dialogs_methods.SavedDialog": ["_apply", "_export_model", "_archive"],
@@ -162,6 +163,30 @@ def test_progressive_dialog_end_to_end(app, tmp_path, messages):
         d._save()
         assert p.results()[-1]["kind"] == "progressive"
 
+        # save the calibrated method, then apply it from Saved methods
+        from PySide6.QtWidgets import QInputDialog
+
+        from spectro.ui.dialogs_methods import SavedDialog
+        orig = QInputDialog.getText
+        QInputDialog.getText = staticmethod(lambda *a, **k: ("AAC test", True))
+        try:
+            d._save_method()
+        finally:
+            QInputDialog.getText = orig
+        saved = p.methods()[-1]
+        assert saved["name"] == "AAC test" and saved["type"] == "amplitude_centering"
+        assert saved["definition"]["divisor"] == div and saved["definition"]["calibration_ids"]
+        mix_ids = [r.id for r in p.records() if r.role == "mixture"]
+        sd = SavedDialog(win)
+        sd.mtable.selectRow(len(sd.methods) - 1)
+        win.selected_ids = lambda: mix_ids
+        sd._apply()
+        assert not messages, messages
+        routine = p.results()[-1]
+        assert routine["kind"] == "routine" and routine["data"]["compounds"] == ["X", "Y", "Z"]
+        assert routine["data"]["found"][1] == pytest.approx([20, 10, 10], rel=5e-4)
+        del win.selected_ids
+
         # absorption factor on a second compound set
         q = Project.create(tmp_path / "a.spectro")
         for c in AF:
@@ -208,5 +233,47 @@ def test_validation_compare_from_summary_values(app, tmp_path, messages):
         t.setItem(0, 2, QTableWidgetItem("abc"))
         v._calc("Compare (mean, SD, n)")
         assert messages and "number" in messages[-1]
+    finally:
+        win.close_project()
+
+
+def test_optimizer_saves_a_progressive_candidate(app, tmp_path, messages):
+    """A ternary project with an extended compound: the optimizer's best
+    amplitude-centering candidate is saved as a calibrated method that uses
+    the project's divisor spectrum."""
+    import spectro.ui.main_window as mw
+    from spectro.ui.dialog_optimizer import OptimizerDialog
+    from tests.test_literature import TER, ter
+
+    win = mw.MainWindow()
+    p = Project.create(tmp_path / "o.spectro")
+    for c in TER:
+        p.add_compound(c)
+    tid = p.add_trial("T")
+    for c in TER:
+        for v in (4, 8, 12, 16, 20, 24):
+            p.add_spectrum(ter({c: v}, f"{c} {v}", noise=0.0003, seed=int(v)), tid,
+                           role="standard")
+    p.add_spectrum(ter({"X": 10, "Y": 10, "Z": 10}, "mix", noise=0.0003, seed=99), tid,
+                   role="mixture")
+    win._attach(p)
+    try:
+        d = OptimizerDialog(win)
+        for i in range(d.fam.count()):
+            it = d.fam.item(i)
+            it.setCheckState(Qt.Checked if it.data(Qt.UserRole) == "amplitude_centering"
+                             else Qt.Unchecked)
+        d._run()
+        assert not messages, messages
+        row = next(i for i, c in enumerate(d.cands) if c.family == "amplitude_centering"
+                   and not c.error)
+        d.table.selectRow(row)
+        d._explain()
+        d._save()
+        assert not messages, messages
+        saved = p.methods()[-1]["definition"]
+        assert saved["type"] == "amplitude_centering" and saved["regressions"]
+        div_ids = {d.div_boxes[c].currentData() for c in TER}
+        assert saved["divisor"] in div_ids
     finally:
         win.close_project()

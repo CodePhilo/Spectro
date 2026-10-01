@@ -1,5 +1,7 @@
 import math
 
+import numpy as np
+
 from spectro.core.optimizer import OptimizerInput, materialize, optimize
 from spectro.core.spectrum import Spectrum
 from tests.conftest import GRID, PURE, mixture
@@ -55,3 +57,69 @@ def test_unit_spectra_recover_absorptivity():
     ref = np.interp(grid, GRID, PURE["X"])
     assert np.allclose(units["X"], ref, atol=1e-6)
     assert isinstance(Spectrum(grid, units["Y"]), Spectrum)
+
+
+# --------------------------------------------------------------------------- #
+# Progressive methods in the optimizer
+# --------------------------------------------------------------------------- #
+def _lit_input(pure_mk, comps, mixes, noise=0.0003):
+    std = {c: [pure_mk({c: v}, f"{c} {v}", noise=noise, seed=int(v) * 7 + i)
+               for i, v in enumerate((4, 8, 12, 16, 20, 24))] for c in comps}
+    div = {c: std[c][3] for c in comps}
+    mx = [pure_mk(m, f"m{i}", noise=noise, seed=100 + i) for i, m in enumerate(mixes)]
+    return OptimizerInput(comps, std, div, mx)
+
+
+def test_optimizer_ranks_amplitude_centering_for_extended_divisor():
+    """Ternary with an extended component (AAC / RIDSS situation): the
+    optimizer builds amplitude-centering methods by itself, verifies them on
+    the laboratory mixtures, and they recover all three compounds."""
+    from tests.test_literature import ter
+    inp = _lit_input(ter, ["X", "Y", "Z"],
+                     [{"X": 10, "Y": 10, "Z": 10}, {"X": 20, "Y": 10, "Z": 10},
+                      {"X": 6, "Y": 6, "Z": 18}, {"X": 12, "Y": 4, "Z": 4}])
+    inp.families = {"amplitude_centering"}
+    res = optimize(inp)
+    for c in inp.compounds:
+        prog = [x for x in res["ranked"][c] if x.family == "amplitude_centering"
+                and not x.error]
+        assert prog, c
+        best = prog[0]
+        assert best.score < 10, (c, best.label, best.score)
+        assert abs(best.real_mean_recovery - 100) < 5
+        assert best.model["type"] == "amplitude_centering"
+        assert best.model["divisor"].startswith("div:")
+    # both structures were generated: plateau (AAC-partial) and λ pairs only
+    labels = {x.label for c in inp.compounds for x in res["ranked"][c]}
+    assert any("plateau" in lab for lab in labels)
+    assert any("plateau" not in lab and "by subtraction" in lab for lab in labels)
+
+
+def test_optimizer_ranks_absorption_factor_and_materializes_it():
+    from spectro.core.univariate import progressive_from_dict
+    from tests.test_literature import af
+    inp = _lit_input(af, ["MET", "MEB", "DLX"],
+                     [{"MET": 10, "MEB": 10, "DLX": 10}, {"MET": 20, "MEB": 4, "DLX": 2},
+                      {"MET": 3, "MEB": 20, "DLX": 15}])
+    inp.families = {"absorption_factor", "zero"}
+    res = optimize(inp)
+    best = next(x for x in res["ranked"]["MET"] if x.family == "absorption_factor")
+    assert best.score < 2
+    order = [c for c, _ in best.model["order"]]
+    assert order[0] == "MET"        # the only compound absorbing alone (above 320 nm)
+    d = materialize(best, {c: 1 for c in inp.compounds})
+    m = progressive_from_dict(d["model"])
+    m.fit_spectra([s for c in inp.compounds for s in inp.standards[c]])
+    out = m.predict_spectra(inp.mixtures)
+    true = [[x.concentrations[c] for c in m.compounds] for x in inp.mixtures]
+    assert np.allclose(out, true, rtol=0.05)
+
+
+def test_materialize_replaces_the_progressive_divisor():
+    from spectro.core.optimizer import Candidate
+    from spectro.core.univariate import AmplitudeCentering
+    m = AmplitudeCentering(260.0, ["X", "Z"], subtract="Z", divisor_compound="Z",
+                           differences={"X": {"w1": 260.0, "w2": 240.0}}, divisor="div:Z")
+    d = materialize(Candidate("X", "amplitude_centering", "", model=m.to_dict()),
+                    {"X": 3, "Z": 7})
+    assert d["model"]["divisor"] == 7

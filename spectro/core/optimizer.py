@@ -30,6 +30,12 @@ error that a candidate method would make for the target compound can be
    plus realistic noise — end-to-end, including the calibration regression.
 3. Candidates are ranked by the larger of the observed error and the
    predicted error including wavelength uncertainty (conservative).
+
+Progressive methods (amplitude centering, successive absorption factor)
+resolve all compounds at once, so they are screened as whole configurations:
+generated from the unit spectra for every divisor compound / compound order,
+run on noise-free standards, scenario mixtures, noise and ±λ-shifted spectra,
+and the best of each structure verified end-to-end like the others.
 """
 
 from __future__ import annotations
@@ -44,7 +50,8 @@ import numpy as np
 from spectro.core.multicomponent import SignalEquations, SpectralModel, kaiser_selection
 from spectro.core.operations import apply_pipeline
 from spectro.core.spectrum import Spectrum, align
-from spectro.core.univariate import UnivariateMethod, measure
+from spectro.core.univariate import (AbsorptionFactorMethod, AmplitudeCentering, UnivariateMethod,
+                                    equal_amplitude_wavelengths, measure, progressive_from_dict)
 from spectro.core.validation import linear_regression
 
 DIV = "div:"  # placeholder prefix for divisor references, e.g. "div:CAF"
@@ -60,6 +67,8 @@ FAMILIES = {
     "ratio_subtraction": "Ratio subtraction / constant multiplication",
     "dual_amplitude": "Dual amplitude difference (ternary)",
     "double_divisor": "Double divisor derivative ratio (ternary)",
+    "amplitude_centering": "Amplitude centering (AAC / MACM / RIDSS / CV-AD)",
+    "absorption_factor": "Successive absorption factor (MAFM)",
     "vierordt": "Vierordt simultaneous equations",
     "bivariate": "Bivariate (Kaiser)",
     "cls": "Classical least squares (full spectrum)",
@@ -613,6 +622,237 @@ def multivariate(inp: OptimizerInput, resolve) -> list[Candidate]:
     return out
 
 
+# --------------------------------------------------------------------------- #
+# Progressive methods (one divisor / a chain of absorption factors)
+# --------------------------------------------------------------------------- #
+def _shifted(s: Spectrum, d: float) -> Spectrum:
+    """The spectrum as an instrument with a wavelength error d would read it."""
+    return s.with_values(np.interp(s.wavelengths - d, s.wavelengths, s.values))
+
+
+class _ProgressiveScreen:
+    """Builds progressive-method configurations from the unit spectra and
+    predicts their error per compound. Everything is evaluated by running the
+    real method: fitted on noise-free standards made from the unit spectra,
+    then applied to the scenario mixtures (interference, which should be ~0
+    by construction), to noise spectra (noise) and to the scenario mixtures
+    read with a ±λ error (robustness)."""
+
+    def __init__(self, sc: _Screen, n_noise: int = 20):
+        self.sc, self.inp = sc, sc.inp
+        self.comps = self.inp.compounds
+        self.grid = sc.grid
+        self.units = sc.units
+        levels = {c: sorted({s.concentrations[c] for s in self.inp.standards[c]})
+                  for c in self.comps}
+        self.std = {c: [Spectrum(self.grid, self.units[c] * v, concentrations={c: v})
+                        for v in (levels[c] if len(levels[c]) >= 3
+                                  else np.linspace(min(levels[c]), max(levels[c]) * 2, 3))]
+                    for c in self.comps}
+        self.mixes = [Spectrum(self.grid, sum(self.units[c] * m[c] for c in self.comps),
+                               concentrations=dict(m)) for m in sc.scen]
+        self.noise = sc.noise[:n_noise]
+        self.zero = Spectrum(self.grid, np.zeros(self.grid.size))
+
+    def evaluate(self, method, divisor: Spectrum | None) -> dict[str, dict] | None:
+        try:
+            if divisor is not None:
+                method.divisor = divisor
+            method.fit_spectra([x for c in self.comps for x in self.std[c]],
+                               lambda ref: divisor)
+
+            def pred(spectra):
+                return method.predict_spectra(spectra, lambda ref: divisor)
+            p0 = pred(self.mixes)
+            pn = pred(self.noise) - pred([self.zero])
+            shifts = [pred([_shifted(m, d) for m in self.mixes])
+                      for d in (-self.inp.wl_uncertainty, self.inp.wl_uncertainty)
+                      if self.inp.wl_uncertainty > 0]
+        except Exception:
+            return None
+        out = {}
+        sd = pn.std(axis=0, ddof=1)
+        for j, c in enumerate(self.comps):
+            true = np.array([m.concentrations[c] for m in self.mixes])
+            ok = true > 0
+            if not ok.any():
+                return None
+            bias = 100 * np.sqrt(np.mean(((p0[ok, j] - true[ok]) / true[ok]) ** 2))
+            noise = 100 * np.sqrt(np.mean((sd[j] / true[ok]) ** 2))
+            err = math.hypot(bias, noise)
+            robust = err
+            for ps in shifts:
+                b = 100 * np.sqrt(np.mean(((ps[ok, j] - true[ok]) / true[ok]) ** 2))
+                robust = max(robust, math.hypot(b, noise))
+            if not np.isfinite(robust):
+                return None
+            out[c] = {"err": float(err), "robust": float(robust), "bias": float(bias),
+                      "noise": float(noise)}
+        return out
+
+    # ---------------------------------------------------------- generation
+    def _lambdas(self, lo, hi, step=4.0):
+        u = self.inp.wl_uncertainty + 1.0
+        return np.arange(lo + u, hi - u + 1e-9, max(step, self.inp.pair_step))
+
+    def amplitude_centering(self) -> list[tuple[AmplitudeCentering, str]]:
+        """Configurations for every choice of divisor compound: complete
+        overlap (MACM / AAC-complete / CV-AD: λ pairs, divisor compound by
+        subtraction) and, when the divisor compound has a plateau, AAC-partial /
+        RIDSS / AM (plateau, equality-factor difference, subtraction)."""
+        out = []
+        for z in self.comps:
+            others = [c for c in self.comps if c != z]
+            if len(others) not in (1, 2):
+                continue
+            div = self.sc.resolve(DIV + z)
+            dv = np.interp(self.grid, div.wavelengths, div.values)
+            region = _valid_region(self.grid, dv, 0.05)
+            if region is None:
+                continue
+            keep = (self.grid >= region[0]) & (self.grid <= region[1])
+            g = self.grid[keep]
+            R = {c: Spectrum(g, self.units[c][keep] / dv[keep]) for c in others}
+            lam = self._lambdas(*region)
+            # complete overlap
+            for lc in lam:
+                diffs = {}
+                for x in others:
+                    rest = [y for y in others if y != x]
+                    if rest:
+                        cands = [w for w in equal_amplitude_wavelengths(R[rest[0]], lc,
+                                                                         region[0] + 2,
+                                                                         region[1] - 2)
+                                 if abs(w - lc) >= 4]
+                    else:
+                        cands = list(self._lambdas(*region, step=2.0))
+                    if not cands:
+                        break
+                    w2 = max(cands, key=lambda w: abs(R[x].value_at(lc) - R[x].value_at(w)))
+                    diffs[x] = {"w1": float(lc), "w2": float(w2)}
+                else:
+                    out.append((AmplitudeCentering(float(lc), list(self.comps), subtract=z,
+                                                   divisor_compound=z, differences=diffs), z))
+            # plateau of the divisor compound
+            pl = _plateau(self.grid, sum(np.abs(self.units[c]) for c in others), self.units[z])
+            if pl is None or pl[0] < region[0] or pl[1] > region[1]:
+                continue
+            for lc in lam:
+                if lc >= pl[0] - 2:
+                    continue
+                if len(others) == 1:
+                    out.append((AmplitudeCentering(float(lc), list(self.comps),
+                                                   subtract=others[0], divisor_compound=z,
+                                                   plateau=pl), z))
+                    continue
+                for a, b in (others, others[::-1]):
+                    best, w2 = 0.0, None
+                    for w in self._lambdas(region[0], pl[0], step=2.0):
+                        if abs(w - lc) < 4 or abs(R[b].value_at(w)) < 1e-12:
+                            continue
+                        f = R[b].value_at(lc) / R[b].value_at(w)
+                        if abs(f) > 20:
+                            continue
+                        d = abs(R[a].value_at(lc) - f * R[a].value_at(w))
+                        if d > best:
+                            best, w2 = d, w
+                    if w2 is not None:
+                        out.append((AmplitudeCentering(
+                            float(lc), list(self.comps), subtract=b, divisor_compound=z,
+                            plateau=pl, differences={a: {"w1": float(lc), "w2": float(w2),
+                                                         "factor_from": b}}), z))
+        return out
+
+    def absorption_factor(self) -> list[AbsorptionFactorMethod]:
+        """Every order of the compounds for which each one has a wavelength
+        where the compounds after it in the order do not absorb."""
+        cmax = {c: max(m[c] for m in self.sc.scen) for c in self.comps}
+        cmin = {c: max(min(m[c] for m in self.sc.scen), 1e-9) for c in self.comps}
+        u = self.inp.wl_uncertainty + 1.0
+        inner = (self.grid >= self.grid[0] + u) & (self.grid <= self.grid[-1] - u)
+        out = []
+        for order in itertools.permutations(self.comps):
+            lams = []
+            for i, c in enumerate(order):
+                later = order[i + 1:]
+                uc = self.units[c]
+                ok = inner & (uc >= 0.05 * uc.max())
+                if later:
+                    inter = sum(np.abs(self.units[k]) * cmax[k] for k in later)
+                    ok &= inter <= 0.002 * uc * cmin[c]
+                if not ok.any():
+                    break
+                idx = np.flatnonzero(ok)
+                lams.append(float(self.grid[idx[np.argmax(uc[idx])]]))
+            else:
+                out.append(AbsorptionFactorMethod(list(zip(order, lams))))
+        return out
+
+
+def progressive(inp: OptimizerInput, sc: _Screen, resolve,
+                progress: Callable[[int, int], Any] | None = None) -> list[Candidate]:
+    """Screen and verify amplitude-centering and absorption-factor methods.
+
+    Each configuration resolves all compounds at once; the best few by their
+    worst compound are verified end-to-end on the real standards, simulated
+    and laboratory mixtures and returned as one candidate per compound."""
+    fam = inp.families or set(FAMILIES)
+    ps = _ProgressiveScreen(sc)
+    configs: list[tuple[str, Any, str | None]] = []
+    if "amplitude_centering" in fam:
+        configs += [("amplitude_centering", m, z) for m, z in ps.amplitude_centering()]
+    if "absorption_factor" in fam:
+        configs += [("absorption_factor", m, None) for m in ps.absorption_factor()]
+    scored = []
+    for k, (family, m, z) in enumerate(configs):
+        if progress is not None and progress(k, len(configs)) is False:
+            raise InterruptedError("cancelled")
+        div = sc.resolve(DIV + z) if z else None
+        ev = ps.evaluate(m, div)
+        if ev is not None:
+            scored.append((max(e["robust"] for e in ev.values()), family, m, z, ev))
+    # best configurations of each kind (family, divisor, structure)
+    best: dict[tuple, list] = {}
+    for item in sorted(scored, key=lambda t: t[0]):
+        _, family, m, z, _ = item
+        key = (family, z, bool(getattr(m, "plateau", None)),
+               tuple(sorted(getattr(m, "differences", {}))))
+        if len(best.setdefault(key, [])) < inp.keep_per_family:
+            best[key].append(item)
+    sims = simulated_mixtures(inp)
+    real = [x for x in inp.mixtures if all(x.concentrations.get(c) for c in inp.compounds)]
+    pure = [x for c in inp.compounds for x in inp.standards[c]]
+    out = []
+    for items in best.values():
+        for _, family, m, z, ev in items:
+            m = progressive_from_dict(m.to_dict())        # fresh copy, no unit-spectrum fit
+            m.divisor = DIV + z if z else None
+            label = f"{FAMILIES[family]}: {m.describe()}"
+            try:
+                m.fit_spectra(pure, resolve)
+                psim = m.predict_spectra(sims, resolve)
+                preal = m.predict_spectra(real, resolve) if real else None
+            except Exception as exc:
+                for c in inp.compounds:
+                    out.append(Candidate(c, family, label, model=m.to_dict(), error=str(exc)))
+                continue
+            for j, c in enumerate(inp.compounds):
+                cand = Candidate(c, family, label, model=m.to_dict(),
+                                 predicted_error=ev[c]["err"], robust_error=ev[c]["robust"],
+                                 interference=ev[c]["bias"], noise=ev[c]["noise"])
+                cand.r = m.regressions[c].r
+                cand.slope = m.regressions[c].slope
+                cand.sim_rmsep = _rel_rmsep(psim[:, j], [x.concentrations[c] for x in sims])
+                if preal is not None:
+                    t = np.array([x.concentrations[c] for x in real])
+                    cand.real_rmsep = _rel_rmsep(preal[:, j], t)
+                    rec = 100 * preal[:, j] / t
+                    cand.real_mean_recovery = float(rec.mean())
+                    cand.real_rsd = float(rec.std(ddof=1)) if rec.size > 1 else math.nan
+                out.append(cand)
+    return out
+
+
 def optimize(inp: OptimizerInput, progress: Callable[[int, int], Any] | None = None) -> dict:
     """Screen + verify. Returns ranked candidates per compound and a summary."""
     def sub(offset, span):
@@ -622,14 +862,16 @@ def optimize(inp: OptimizerInput, progress: Callable[[int, int], Any] | None = N
     for c in inp.compounds:
         for s in inp.standards[c]:
             s.concentrations = {**{k: 0.0 for k in inp.compounds}, **s.concentrations}
-    cands = screen(inp, sub(0, 60))
+    cands = screen(inp, sub(0, 50))
     sc = _Screen(inp)
     ok = [c for c in cands if not c.error]
-    verify(ok, inp, sc.resolve, sub(60, 30))
+    verify(ok, inp, sc.resolve, sub(50, 25))
+    prog = progressive(inp, sc, sc.resolve, sub(75, 15))
     multi = multivariate(inp, sc.resolve)
     if progress is not None:
         progress(100, 100)
-    everything = ok + multi + [c for c in cands if c.error]
+    everything = ok + [c for c in prog if not c.error] + multi + [c for c in cands if c.error] \
+        + [c for c in prog if c.error]
     ranked = {c: sorted([x for x in everything if x.compound == c], key=lambda x: x.score)
               for c in inp.compounds}
     return {"ranked": ranked,
@@ -650,7 +892,13 @@ def materialize(c: Candidate, divisor_ids: dict[str, int]) -> dict:
     if c.measurement:
         meas = {"kind": c.measurement["kind"],
                 "params": {k: fix(v) for k, v in c.measurement["params"].items()}}
-    return {"steps": steps, "measurement": meas}
+    out = {"steps": steps, "measurement": meas}
+    if c.model is not None:
+        model = dict(c.model)
+        if "divisor" in model:
+            model["divisor"] = fix(model["divisor"])
+        out["model"] = model
+    return out
 
 
 def explain(c: Candidate, inp: OptimizerInput, resolve) -> dict[str, Spectrum]:
@@ -661,5 +909,5 @@ def explain(c: Candidate, inp: OptimizerInput, resolve) -> dict[str, Spectrum]:
 
 
 __all__ = ["Candidate", "OptimizerInput", "FAMILIES", "optimize", "screen", "verify",
-           "multivariate", "materialize", "explain", "simulated_mixtures", "unit_spectra",
+           "multivariate", "progressive", "materialize", "explain", "simulated_mixtures", "unit_spectra",
            "measure", "linear_regression"]

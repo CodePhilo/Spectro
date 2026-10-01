@@ -26,10 +26,15 @@ def spectrum_refs(d: dict) -> set[int]:
         v = sig.get("params", {}).get("reference")
         if v is not None:
             out.add(int(v))
+    if d.get("type") == "amplitude_centering" and d.get("divisor") is not None:
+        out.add(int(d["divisor"]))
     return out
 
 
 def remap_refs(d: dict, mapping: dict[int, int]) -> None:
+    if d.get("type") == "amplitude_centering" and d.get("divisor") is not None \
+            and int(d["divisor"]) in mapping:
+        d["divisor"] = mapping[int(d["divisor"])]
     for st in d.get("steps", []):
         op = REGISTRY.get(st.get("op"))
         for p in (op.params if op else []):
@@ -54,6 +59,8 @@ def is_calibrated(d: dict) -> bool:
         return d.get("regression") is not None
     if t == "equations":
         return d.get("K") is not None
+    if t in ("amplitude_centering", "absorption_factor"):
+        return bool(d.get("regressions"))
     return False
 
 

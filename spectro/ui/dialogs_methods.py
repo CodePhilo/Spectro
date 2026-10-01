@@ -1023,14 +1023,7 @@ class SpecialDialog(Base):
 # --------------------------------------------------------------------------- #
 # Progressive resolution (amplitude centering, absorption factor)
 # --------------------------------------------------------------------------- #
-def pure_standards(spectra, compounds: list[str]) -> dict[str, list]:
-    """Group pure standards by their single non-zero concentration."""
-    out: dict[str, list] = {c: [] for c in compounds}
-    for s in spectra:
-        nz = [c for c, v in s.concentrations.items() if v]
-        if len(nz) == 1 and nz[0] in out:
-            out[nz[0]].append(s)
-    return out
+pure_standards = uv.pure_standards
 
 
 def _cell(t: QTableWidget, i: int, j: int) -> str:
@@ -1057,6 +1050,7 @@ class ProgressiveDialog(Base):
         self.resize(1300, 860)
         self.comps = self.project.compound_names()
         self.last = None
+        self.fitted = None          # (method, calibration ids) of the last calculation
         tabs = QTabWidget()
         tabs.addTab(self._ac_tab(), "Amplitude centering (one divisor, one λ)")
         tabs.addTab(self._af_tab(), "Absorption factor (successive)")
@@ -1069,10 +1063,17 @@ class ProgressiveDialog(Base):
         lay.addWidget(self.results, 1)
         lay.addWidget(self.summary)
         row = QHBoxLayout()
-        save = QPushButton("Save results")
-        save.clicked.connect(self._save)
         row.addStretch(1)
-        row.addWidget(save)
+        for text, fn, tip in (
+                ("Save method", self._save_method,
+                 "Save the calibrated method with its divisor so it can be applied to new "
+                 "samples from Methods → Saved methods, exported as a .spmodel file and "
+                 "reported"),
+                ("Save results", self._save, "")):
+            b = QPushButton(text)
+            b.setToolTip(tip)
+            b.clicked.connect(fn)
+            row.addWidget(b)
         lay.addLayout(row)
 
     def _lists(self):
@@ -1155,9 +1156,12 @@ class ProgressiveDialog(Base):
     def _run_ac(self):
         try:
             m = self._ac_method()
-            div = self.project.spectrum(self.ac_div.currentData())
-            std = pure_standards(self.project.spectra(self.ac_std.checked_ids()), m.compounds)
-            info = m.fit(std, div)
+            if self.ac_div.currentData() is None:
+                raise ValueError("choose the divisor spectrum")
+            m.divisor = self.ac_div.currentData()
+            div = self.project.spectrum(m.divisor)
+            cal = self.ac_std.checked_ids()
+            info = m.fit_spectra(self.project.spectra(cal), self.project.resolver())
             mixes = self.project.spectra(self.ac_mix.checked_ids())
             out = [(s, m.predict(s, div)) for s in mixes]
         except Exception as exc:
@@ -1167,8 +1171,8 @@ class ProgressiveDialog(Base):
         lines += [f"{c}: amplitude-difference line r = {r:.5f}"
                   for c, r in info["difference_r"].items()]
         lines += [f"Equality factor for {c}: {f:.5g}" for c, f in info["factors"].items()]
-        self._show("Amplitude centering", m.compounds, out,
-                   {**m.to_dict(), "divisor": self.ac_div.currentData()}, lines)
+        self.fitted = (m, cal)
+        self._show("Amplitude centering", m.compounds, out, m.to_dict(), lines)
 
     def _af_tab(self):
         w = QWidget()
@@ -1214,7 +1218,8 @@ class ProgressiveDialog(Base):
                     quant[c] = q
             m = uv.AbsorptionFactorMethod(order, quant)
             comps = [c for c, _ in order]
-            info = m.fit(pure_standards(self.project.spectra(self.af_std.checked_ids()), comps))
+            cal = self.af_std.checked_ids()
+            info = m.fit_spectra(self.project.spectra(cal))
             out = [(s, m.predict(s)) for s in self.project.spectra(self.af_mix.checked_ids())]
         except Exception as exc:
             error(self, exc)
@@ -1222,6 +1227,7 @@ class ProgressiveDialog(Base):
         lines = [f"{c}: calibration r = {r:.5f}" for c, r in info["r"].items()]
         lines += [f"Factors of {c}: " + ", ".join(f"F({k} nm) = {v:.4f}" for k, v in fs.items())
                   for c, fs in info["factors"].items()]
+        self.fitted = (m, cal)
         self._show("Absorption factor method", comps, out, m.to_dict(), lines)
 
     def _show(self, method: str, comps: list[str], out, params: dict, lines: list[str]):
@@ -1254,8 +1260,25 @@ class ProgressiveDialog(Base):
             return
         method, data = self.last
         self.project.save_result(method, "progressive", data, self.win.current_trial(),
-                                 inputs=data.get("ids"))
+                                 getattr(self, "method_id", None), data.get("ids"))
         self.win.statusBar().showMessage("Results saved.")
+
+    def _save_method(self):
+        if not self.fitted:
+            error(self, "Calculate first.")
+            return
+        m, cal = self.fitted
+        kind = ("Amplitude centering" if isinstance(m, uv.AmplitudeCentering)
+                else "Absorption factor")
+        name, ok = QInputDialog.getText(self, "Save method", "Method name:",
+                                        text=f"{kind}: {m.describe()}")
+        if not ok:
+            return
+        m.name = name.strip() or kind
+        d = m.to_dict()
+        d["calibration_ids"] = list(cal)
+        self.method_id = self.project.save_method(m.name, d, self.win.current_trial())
+        self.win.statusBar().showMessage(f"Method #{self.method_id} saved.")
 
 
 # --------------------------------------------------------------------------- #
@@ -1660,6 +1683,8 @@ class ChemometricsDialog(Base):
 # --------------------------------------------------------------------------- #
 def method_from_definition(d: dict):
     t = d.get("type")
+    if t in uv.PROGRESSIVE_TYPES:
+        return uv.progressive_from_dict(d)
     if t == "univariate":
         return uv.UnivariateMethod.from_dict(d)
     if t == "equations":
@@ -1817,6 +1842,11 @@ class SavedDialog(Base):
                 if m.K is None:
                     m.fit(self.project.spectra(d["calibration_ids"]), res)
                 found = m.predict(spectra, res).tolist()
+                comps = m.compounds
+            elif d["type"] in uv.PROGRESSIVE_TYPES:
+                if not m.is_fitted:
+                    m.fit_spectra(self.project.spectra(d["calibration_ids"]), res)
+                found = m.predict_spectra(spectra, res).tolist()
                 comps = m.compounds
             else:
                 if not m.is_fitted:

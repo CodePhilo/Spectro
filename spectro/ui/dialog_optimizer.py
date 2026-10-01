@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QGroupBox, QHBoxLayout, QLabel,
                                QLineEdit, QListWidget, QListWidgetItem, QPushButton, QSplitter,
@@ -247,6 +249,9 @@ class OptimizerDialog(Base):
             return
         c = self.cands[r]
         self.plot.clear_markers()
+        if c.family == "amplitude_centering" and c.model:
+            self._explain_centering(c)
+            return
         if not c.measurement:
             grid, units = self.result["grid"], self.result["units"]
             self.plot.plot_spectra([Spectrum(grid, u, name=f"{k} (1 unit)")
@@ -273,6 +278,30 @@ class OptimizerDialog(Base):
             f"with a ±{self.inp.wl_uncertainty:g} nm wavelength error the predicted error "
             f"is ≤ {c.robust_error:.2f} %.")
 
+    def _explain_centering(self, c):
+        from spectro.core.optimizer import DIV, _Screen
+        m = c.model
+        grid, units = self.result["grid"], self.result["units"]
+        try:
+            div = _Screen(self.inp).resolve(DIV + m["divisor_compound"])
+            dv = np.interp(grid, div.wavelengths, div.values)
+            ok = np.abs(dv) >= 0.05 * np.max(np.abs(dv))
+            self.plot.plot_spectra([Spectrum(grid[ok], u[ok] / dv[ok], name=f"{k} ÷ "
+                                             f"{m['divisor_compound']}′ (1 unit)")
+                                    for k, u in units.items()])
+        except Exception as exc:
+            self.expl.setText(str(exc))
+            return
+        self.plot.set_marker("λc", m["wavelength"], movable=False)
+        for k, d in m["differences"].items():
+            self.plot.set_marker(f"λ2 {k}", d["w2"], movable=False)
+        self.expl.setText(
+            "Ratio spectra of one unit of each compound. Every compound is read at the common "
+            "λc: from the plateau, from an amplitude difference at a λ pair where the other "
+            "compounds cancel, or by subtracting the others from the recorded amplitude. "
+            f"Predicted error with ±{self.inp.wl_uncertainty:g} nm: {c.robust_error:.2f} % "
+            f"(noise {c.noise:.2f} %).")
+
     # ------------------------------------------------------------ save
     def _save(self):
         r = self.table.currentRow()
@@ -292,6 +321,14 @@ class OptimizerDialog(Base):
                 m = UnivariateMethod(c.label, c.compound, d["steps"], d["measurement"])
                 ids = self.std_ids[c.compound]
                 m.calibrate(self.project.spectra(ids), self.project.resolver())
+                definition = m.to_dict()
+            elif c.family in ("amplitude_centering", "absorption_factor"):
+                from spectro.core.univariate import progressive_from_dict
+                d = materialize(c, {k: self.div_boxes[k].currentData() for k in comps})
+                m = progressive_from_dict(d["model"])
+                m.name = c.label
+                ids = [i for k in comps for i in self.std_ids[k]]
+                m.fit_spectra(self.project.spectra(ids), self.project.resolver())
                 definition = m.to_dict()
             else:
                 definition = dict(c.model)

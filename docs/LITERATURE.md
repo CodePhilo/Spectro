@@ -53,10 +53,12 @@ found. The PDFs themselves are not in the repository.
 | PLS with 5-level calibration design, LOO CV (SL17) | *Methods → Chemometrics*, *Tools → Calibration design* | ✅ |
 | Student's t, F, one-way ANOVA vs official / reported method (all) | *Tools → Validation statistics*: raw data (*Compare methods*, *Precision*) and **from published mean, SD, n** (*Compare (mean, SD, n)*) | 🆕 (summary values) 🔧 (F convention) |
 
-**Nothing used in these nine papers is now missing.** Two caveats: the
-progressive methods (amplitude centering, absorption factor) report results
-but cannot yet be saved as reusable methods (*Saved methods → Apply*), and
-the method optimizer does not yet try them automatically.
+**Nothing used in these nine papers is now missing.** The progressive
+methods (amplitude centering, absorption factor) are saved like any other
+method (*Save method* in the dialog; *Saved methods → Apply*, `.spmodel`
+export with the divisor embedded), and the method optimizer builds, screens
+and verifies them automatically (families *Amplitude centering* and
+*Successive absorption factor*).
 
 ## What the validation tests check
 
