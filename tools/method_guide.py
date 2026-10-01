@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (QApplication, QInputDialog, QMessageBox,  # noqa:
                                QTableWidgetItem)
 
 from _png import compact_png  # noqa: E402
+from guide_text import BEGINNER, PRIMER  # noqa: E402
 from spectro.core import univariate as uv  # noqa: E402
 from spectro.core.catalog import CATEGORIES, DESCRIPTIONS  # noqa: E402
 from spectro.core.multicomponent import design_concentrations  # noqa: E402
@@ -567,6 +568,8 @@ class Guide:
         QInputDialog.getText = staticmethod(lambda *a, **k: ("guide example", True))
         self.out, self.app = out, app
         out.mkdir(parents=True, exist_ok=True)
+        (out / "img").mkdir(exist_ok=True)
+        (out / "data").mkdir(exist_ok=True)
         self.win = mw.MainWindow()
         self.win.resize(1400, 860)
         from spectro.storage.project import Project
@@ -608,6 +611,13 @@ class Guide:
             self.mix[name] = [p.add_spectrum(spec(m, "Mix " + ", ".join(
                 f"{k} {v:g}" for k, v in m.items())), tid, role="mixture")
                 for m in sysd["mixtures"]]
+        # spectra processed once for the finder screenshots
+        self.ids["B′ D1"] = p.process([self.ids["B′"]], [{"op": "derivative",
+                                                          "params": dict(self.D1)}], "D1")[0]
+        self.ids["Mix ÷ B′"] = p.process([self.mix["Binary A + B"][0]],
+                                         [{"op": "divide",
+                                           "params": {"reference": self.ids["B′"]}}],
+                                         "ratio to B′")[0]
         # second divisor for the successive derivative ratio: D1(Z′ ÷ Y′)
         self.ids["D1(Z′/Y′)"] = p.process(
             [self.ids["Z′"]], [{"op": "divide", "params": {"reference": self.ids["Y′"]}},
@@ -628,18 +638,20 @@ class Guide:
         return Spectrum(GRID, SYSTEMS[SYSTEM_OF[c]]["pure"][c], name=c)
 
     # ------------------------------------------------------------ helpers
-    def shot(self, widget, key, height=820) -> str:
-        widget.resize(max(widget.width(), 1300), max(widget.height(), height))
+    def shot(self, widget, key, height=820, keep=False) -> str:
+        sz = widget.size()          # (FinderDialog has a 'width' attribute)
+        widget.resize(max(sz.width(), 1300), max(sz.height(), height))
         widget.show()
         for _ in range(4):
             self.app.processEvents()
         pm = widget.grab()
-        if pm.width() > 1300:
-            pm = pm.scaledToWidth(1300, Qt.SmoothTransformation)
-        name = f"{key}.png"
+        if pm.width() > 1200:
+            pm = pm.scaledToWidth(1200, Qt.SmoothTransformation)
+        name = f"img/{key}.png"
         pm.save(str(self.out / name))
         compact_png(self.out / name)
-        widget.close()
+        if not keep:
+            widget.close()
         return name
 
     def table(self, comps, spectra_names, found, taken):
@@ -693,7 +705,21 @@ class Guide:
         d.plot.plot_spectra([apply_pipeline(s, d.method.steps, res_)
                              for s in self.p.spectra(mix)], keep_range=False)
         d._markers()
-        img = self.shot(d, key)
+        images = [self.concept_univariate(key, compound, d.method)]
+        images.append((self.shot(d, f"{key}_1", keep=True),
+                       "Step 1 — the method set up in *Methods → Univariate calibration*: "
+                       "compound, template, processing steps (left) and the laboratory "
+                       "mixtures after processing with the measuring wavelength(s) marked "
+                       "(right)."))
+        d.tabs.setCurrentIndex(1)
+        images.append((self.shot(d, f"{key}_2", keep=True),
+                       "Step 2 — *Calibrate*: the calibration line of the standards, its "
+                       "residuals and the regression statistics (slope, intercept, r, LOD, "
+                       "LOQ)."))
+        d.tabs.setCurrentIndex(2)
+        images.append((self.shot(d, f"{key}_3"),
+                       "Step 3 — *Determine*: found and taken concentrations and % recovery "
+                       "of each mixture, with mean and RSD."))
         pr = d.predictions
         res = self.table([compound], pr["names"], [[f] for f in pr["found"]],
                          [[t] for t in pr["taken"]])
@@ -703,19 +729,40 @@ class Guide:
         settings += ["Step: " + describe_step(st, lambda r: name_of.get(r, str(r)))
                      for st in d.method.steps]
         mp = d.method.measurement["params"]
-        settings.append("Measurement: " + uv.MEASUREMENTS[d.method.measurement["kind"]].label
-                        + " — " + ", ".join(
-                            f"{k} = {name_of.get(v, v) if k == 'reference' else fmt(v)}"
-                            for k, v in mp.items() if v is not None))
-        settings.append("The screenshot shows the laboratory mixtures after the processing "
-                        "steps, with the measuring wavelength(s) marked.")
+        meas_txt = (uv.MEASUREMENTS[d.method.measurement["kind"]].label + " — " + ", ".join(
+            f"{k} = {name_of.get(v, v) if k == 'reference' else fmt(v)}"
+            for k, v in mp.items() if v is not None))
+        settings.append("Measurement: " + meas_txt)
         settings.append(f"Calibration: slope {reg.slope:.5g}, intercept {reg.intercept:.3g}, "
                         f"r = {reg.r:.5f} (n = {reg.n})")
         if spike:
             res["headers"].append("Found − added")
             for row, f in zip(res["rows"], pr["found"]):
                 row.append(f"{f - spike:.3f}")
-        return {"image": img, "settings": settings + (notes or []), **res}
+        cal = self.p.spectra(d.cal_ids)
+        calc = {"compound": compound, "signal": meas_txt, "direct": d.method.direct,
+                "spike": spike,
+                "cal": [(s.metadata["id"], s.concentrations[compound], d.method.signal(s, res_))
+                        for s in cal],
+                "test": [(i, t, sg) for i, t, sg in zip(pr["ids"], pr["taken"], pr["signals"])]}
+        refs = self.refs_in(d.method.steps, d.method.measurement)
+        data = {"sheets": {"Standards": list(d.cal_ids), "Divisor": refs,
+                           ("Samples" if spike or mixtures is not None else "Mixtures"): list(mix)},
+                "calc": calc}
+        return {"images": images, "settings": settings + (notes or []), "data": data, **res}
+
+    def refs_in(self, steps, measurement=None) -> list[int]:
+        from spectro.core.operations import REGISTRY
+        out = []
+        for st in steps:
+            for prm in REGISTRY[st["op"]].params:
+                v = st["params"].get(prm.name)
+                if prm.kind == "spectrum" and v is not None and int(v) not in out:
+                    out.append(int(v))
+        v = (measurement or {}).get("params", {}).get("reference")
+        if v is not None and int(v) not in out:
+            out.append(int(v))
+        return out
 
     # ------------------------------------------------------------ finders
     def zero_crossing(self, c, lo, hi, steps):
@@ -755,6 +802,193 @@ class Guide:
     def iso(self, a, b, lo, hi):
         return [w for w in uv.isoabsorptive_points(self.unit(a), self.unit(b)) if lo < w < hi]
 
+    # ------------------------------------------------------------ primer
+    def primer_shots(self, workbook: Path, workdir: Path) -> list[tuple[str, str]]:
+        """Import a sample workbook into a new project, as a beginner would."""
+        from spectro.storage.project import Project
+        from spectro.ui.dialogs_data import ImportDialog
+        p = Project.create(workdir / "beginner.spectro", "My first project")
+        for c in ("A", "B"):
+            p.add_compound(c)
+        p.add_trial("Ratio difference example")
+        self.win._attach(p)
+        d = ImportDialog(self.win)
+        d.resize(1250, 760)
+        d.files = [str(workbook)]
+        d._reparse()
+        d._parse_names()
+        d.table.selectRow(6)
+        shots = [(self.shot(d, "primer_import", 760, keep=True),
+                  "Importing a sample workbook: *File → Import spectra… → Add files…*, then "
+                  "*Fill concentrations from names*. Each row is one spectrum; the Role column "
+                  "comes from the sheet name and the A / B columns from the column titles.")]
+        d._import()
+        recs = p.records()
+        from tools_select import select_ids
+        select_ids(self.win, [r.id for r in recs if r.role == "standard"])
+        shots.append((self.shot(self.win, "primer_project", 860),
+                      "After import: the spectra are in the project tree with their roles "
+                      "and concentrations; selecting them plots them. Every import is "
+                      "recorded in the audit trail."))
+        self.win.close_project()
+        return shots
+
+    # ------------------------------------------------------------ concept figures
+    COLOURS = ["#2a78d6", "#d6862a", "#3a9a5b"]
+
+    def _fig(self, n=2):
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        fig, axes = plt.subplots(1, n, figsize=(12.5 if n == 2 else 7.5, 3.9))
+        axes = list(np.atleast_1d(axes))
+        for ax in axes:
+            ax.grid(alpha=0.2)
+            ax.set_xlabel("Wavelength (nm)")
+        return fig, axes
+
+    def _save_fig(self, fig, key, caption):
+        import matplotlib.pyplot as plt
+        fig.tight_layout()
+        name = f"img/{key}_concept.png"
+        fig.savefig(self.out / name, dpi=96)
+        plt.close(fig)
+        compact_png(self.out / name)
+        return (name, caption)
+
+    def _system_mix(self, compound):
+        sysd = SYSTEMS[SYSTEM_OF[compound]]
+        return sysd, sysd["mixtures"][0]
+
+    def _zero_panel(self, ax, compound, marks=(), spans=()):
+        sysd, mixc = self._system_mix(compound)
+        total = np.zeros_like(GRID)
+        for col, (c, u) in zip(self.COLOURS, sysd["pure"].items()):
+            ax.plot(GRID, u * mixc[c], color=col, lw=1.8, label=f"{c} {mixc[c]:g} µg/mL alone")
+            total += u * mixc[c]
+        ax.plot(GRID, total, color="#222", lw=1.4, ls="--", label="the mixture (sum)")
+        self._marks(ax, marks, spans)
+        ax.set_title("Zero-order spectra: the mixture is the sum of its components", fontsize=10)
+        ax.set_ylabel("Absorbance")
+        ax.set_xlim(200, 400)
+        ax.legend(frameon=False, fontsize=8)
+
+    @staticmethod
+    def _marks(ax, marks=(), spans=()):
+        for lab, x in marks:
+            ax.axvline(x, color="#555", lw=1.1)
+            ax.annotate(lab, (x, 1), xycoords=("data", "axes fraction"), xytext=(3, -12),
+                        textcoords="offset points", fontsize=8, color="#333")
+        for lab, (a, b) in spans:
+            ax.axvspan(a, b, color="#f2c14e", alpha=0.25)
+            ax.annotate(lab, ((a + b) / 2, 0.02), xycoords=("data", "axes fraction"),
+                        ha="center", fontsize=8, color="#7a5a00")
+
+    def concept_univariate(self, key, compound, method):
+        """Left: zero-order spectra; right: each compound processed ALONE by
+        the method's steps — the analyte keeps a signal at the measuring λ, the
+        interferents give ≈ 0 there (or a constant that the measurement removes)."""
+        from spectro.core.operations import apply_pipeline
+        res = self.p.resolver()
+        sysd, mixc = self._system_mix(compound)
+        fig, (a1, a2) = self._fig(2)
+        p = method.measurement["params"]
+        kind = method.measurement["kind"]
+        if kind in ("amplitude",):
+            marks, spans = [("λ", p["w1"])], []
+        elif kind in ("difference", "weighted_difference", "ratio"):
+            marks, spans = [("λ1", p["w1"]), ("λ2", p["w2"])], []
+        else:
+            marks, spans = [], [(kind, (p["w1"], p["w2"]))]
+        for st in method.steps:
+            q = st["params"]
+            if "start" in q and "end" in q and st["op"] != "mean_center" and \
+                    st["op"] != "divide_centered_ratio":
+                spans.append(("plateau", (q["start"], q["end"])))
+            if q.get("wavelength_end"):
+                spans.append(("factor range", (q["wavelength"], q["wavelength_end"])))
+            elif "wavelength" in q and st["op"] in ("factorized_recovery",
+                                                     "spectrum_subtraction"):
+                marks.append(("factor λ", q["wavelength"]))
+        self._zero_panel(a1, compound)
+        # ratio spectra are meaningless where the divisor is ≈ 0: hide that region
+        keep = None
+        for st in method.steps:
+            ref = st["params"].get("reference") if st["op"] in (
+                "divide", "divide_sum", "divide_centered_ratio") else \
+                st["params"].get("divisor") if st["op"] in (
+                    "ratio_subtraction", "constant_multiplication",
+                    "extended_ratio_subtraction", "constant_center") else None
+            if ref is not None:
+                dv = res(ref)
+                big = np.abs(dv.values) >= 0.05 * np.max(np.abs(dv.values))
+
+                def keep(x, dv=dv, big=big):
+                    return np.interp(x, dv.wavelengths, big.astype(float)) > 0.5
+                break
+        total = None
+        for col, (c, u) in zip(self.COLOURS, sysd["pure"].items()):
+            out = apply_pipeline(Spectrum(GRID, u * mixc[c]), method.steps, res)
+            y = out.values.copy()
+            if keep is not None:
+                y[~keep(out.wavelengths)] = np.nan
+            a2.plot(out.wavelengths, y, color=col, lw=2.2 if c == compound else 1.6,
+                    label=f"{c} alone, processed" + ("  ← analyte" if c == compound else ""))
+            total = y if total is None else total + y
+        a2.plot(out.wavelengths, total, color="#222", lw=1.2, ls="--",
+                label="mixture, processed")
+        self._marks(a2, marks, spans)
+        a2.axhline(0, color="#999", lw=0.8)
+        a2.set_title("After the processing steps (each compound processed alone)",
+                     fontsize=10)
+        a2.set_ylabel("Processed signal")
+        a2.legend(frameon=False, fontsize=8)
+        others = [c for c in sysd["pure"] if c != compound]
+        return self._save_fig(fig, key, (
+            "Why it works — left: the spectra of the components and of the mixture "
+            f"(they overlap). Right: each component processed alone with the method's steps. "
+            f"At the marked wavelength(s) the processed {', '.join(others)} "
+            "contribute nothing (≈ 0, or a constant that the measurement cancels), so the "
+            f"mixture's signal there belongs to {compound} only."))
+
+    def concept_zero(self, key, compound, marks=(), spans=(), caption=""):
+        fig, (ax,) = self._fig(1)
+        self._zero_panel(ax, compound, marks, spans)
+        return self._save_fig(fig, key, caption)
+
+    def concept_ratio(self, key, compound, divisor_id, marks=(), spans=(), caption="",
+                      label="divisor"):
+        sysd, mixc = self._system_mix(compound)
+        div = self.p.spectrum(divisor_id).values
+        ok = np.abs(div) >= 0.05 * np.max(np.abs(div))
+        fig, (a1, a2) = self._fig(2)
+        self._zero_panel(a1, compound)
+        tot = np.zeros(ok.sum())
+        for col, (c, u) in zip(self.COLOURS, sysd["pure"].items()):
+            r = u[ok] * mixc[c] / div[ok]
+            tot += r
+            a2.plot(GRID[ok], r, ".", ms=2.2, color=col, label=f"{c} alone ÷ {label}")
+        a2.plot(GRID[ok], tot, ".", ms=1.6, color="#222", label="mixture ÷ " + label)
+        self._marks(a2, marks, spans)
+        a2.set_title(f"Ratio spectra (÷ {label}); the divisor compound is a flat constant",
+                     fontsize=10)
+        a2.set_ylabel("Ratio amplitude")
+        a2.legend(frameon=False, fontsize=8, markerscale=4)
+        return self._save_fig(fig, key, caption)
+
+    # ------------------------------------------------------------ finder screenshots
+    def finder_shot(self, key, a_id, b_id, action, lo, hi, caption):
+        from spectro.ui.dialogs_tools import FinderDialog
+        self.win.selected_ids = lambda: [a_id, b_id]
+        d = FinderDialog(self.win)
+        del self.win.selected_ids
+        d.resize(1300, 760)
+        d.lo.setValue(lo)
+        d.hi.setValue(hi)
+        getattr(d, action)()
+        return (self.shot(d, f"{key}_finder", 760),
+                "How the wavelength was found — *Tools → Spectral finder*: " + caption)
+
     # ------------------------------------------------------------ examples
     D1 = {"order": 1, "delta_lambda": 4.0, "scaling": 10.0}
 
@@ -765,9 +999,14 @@ class Guide:
 
     def dw(self):
         w2 = round(self.equal("B", 245.0, 205, 300)[0], 1)
-        return self.univariate("dw", "A", "Dual wavelength", meas={"w1": 245.0, "w2": w2},
-                               notes=[f"Finder: B has the same absorbance at 245 nm and "
-                                      f"{w2} nm."])
+        out = self.univariate("dw", "A", "Dual wavelength", meas={"w1": 245.0, "w2": w2},
+                              notes=[f"Finder: B has the same absorbance at 245 nm and "
+                                     f"{w2} nm."])
+        out["images"].insert(1, self.finder_shot(
+            "dw", self.ids["B′"], self.ids["B′"], "_equal", 245, 400,
+            "spectrum A = the B′ standard, *From* = 245 nm (λmax of A) → *λ where A equals its "
+            f"value at From*: B has the same absorbance at {w2} nm."))
+        return out
 
     def idw(self):
         return self.univariate("idw", "A", "Induced dual wavelength",
@@ -778,7 +1017,7 @@ class Guide:
         return self.univariate("auc1", "B", "Area under curve (single component)",
                                meas={"w1": 320.0, "w2": 350.0, "baseline": "zero"})
 
-    def _special(self, key, tab, setup, run):
+    def _special(self, key, tab, setup, run, concept=None, divisor=None):
         from spectro.ui.dialogs_methods import SpecialDialog
         d = SpecialDialog(self.win)
         d.resize(1300, 820)
@@ -787,15 +1026,22 @@ class Guide:
         getattr(d, run)()
         img = self.shot(d, key)
         _, data = d.last
+        images = ([concept] if concept else []) + [(img, (
+            f"The method in *Methods → Binary two-signal methods → {d.tabs.tabText(tab)}*: "
+            "settings (left), the standards and mixtures used (checked), and the results with "
+            "recoveries (bottom)."))]
+        wb = {"sheets": {"Standards": sorted(self._std_ids(data["X"], data["Y"])),
+                         "Divisor": [divisor] if divisor else [], "Mixtures": data["ids"]}}
         names = [self.p.record(i).name for i in data["ids"]]
         found = [[r["X"], r["Y"]] for r in data["found"]]
         taken = [[self.p.record(i).concentrations.get(data["X"]),
                   self.p.record(i).concentrations.get(data["Y"])] for i in data["ids"]]
         res = self.table([data["X"], data["Y"]], names, found, taken)
-        return {"image": img, "settings": [f"{k}: {fmt(v) if isinstance(v, float) else v}"
-                                           for k, v in data["params"].items()
-                                           if not isinstance(v, (list, tuple, dict))
-                                           and k != "divisor"], **res}
+        return {"images": images, "data": wb,
+                "settings": [f"{k}: {fmt(v) if isinstance(v, float) else v}"
+                             for k, v in data["params"].items()
+                             if not isinstance(v, (list, tuple, dict)) and k != "divisor"],
+                **res}
 
     def _std_ids(self, *comps):
         return {self.ids[f"{c} {v}"] for c in comps for v in SYSTEMS[SYSTEM_OF[c]]["levels"]}
@@ -811,7 +1057,17 @@ class Guide:
             check_only(d.q_xs, self._std_ids("A"))
             check_only(d.q_ys, self._std_ids("B"))
             check_only(d.q_mix, self.mix["Binary A + B"])
-        out = self._special("q", 0, setup, "_run_q")
+        concept = self.concept_zero(
+            "q", "A", [("iso", iso), ("λ2", 245.0)],
+            caption=f"Why it works — at the isoabsorptive point ({iso:.1f} nm) A and B of equal "
+                    "concentration absorb the same, so the mixture's absorbance there measures "
+                    "A + B; the ratio of the mixture's absorbances at λ2 and iso tells how the "
+                    "total is split.")
+        out = self._special("q", 0, setup, "_run_q", concept)
+        out["images"].insert(1, self.finder_shot(
+            "q", self.ids["A 12"], self.ids["B 12"], "_iso", 220, 300,
+            "spectrum A = an A standard, spectrum B = a B standard, *Divide by total "
+            "concentration* ticked → *Isoabsorptive points of A and B*."))
         out["settings"].insert(0, f"Isoabsorptive point (finder): {iso:.1f} nm; λ2 = 245 nm "
                                   "(λmax of A)")
         return out
@@ -827,7 +1083,12 @@ class Guide:
             check_only(d.as_xs, self._std_ids("B"))
             check_only(d.as_all, self._std_ids("A", "B"))
             check_only(d.as_mix, self.mix["Binary A + B"])
-        out = self._special("as", 1, setup, "_run_as")
+        concept = self.concept_zero(
+            "as", "A", [("iso", iso), ("λ2", 335.0)],
+            caption="Why it works — B absorbs alone at λ2 (335 nm): its reading there, times "
+                    "B's own ratio A(iso)/A(λ2), gives B's absorbance at the isoabsorptive point; "
+                    "the rest of the absorbance at iso belongs to A.")
+        out = self._special("as", 1, setup, "_run_as", concept)
         out["settings"].insert(0, f"X = B (absorbs alone at λ2 = 335 nm); iso = {iso:.1f} nm")
         return out
 
@@ -843,7 +1104,12 @@ class Guide:
             check_only(d.aas_xs, self._std_ids("A"))
             check_only(d.aas_ys, self._std_ids("B"))
             check_only(d.aas_mix, self.mix["Binary A + B"])
-        out = self._special("aas", 2, setup, "_run_aas")
+        concept = self.concept_zero(
+            "aas", "A", [("λ2 = iso", iso), ("λ1", w1)],
+            caption="Why it works — B absorbs the same at λ1 and λ2 (= isoabsorptive point), so "
+                    "A(λ2) − A(λ1) of the mixture depends on A only; A's share at λ2 follows and "
+                    "the remainder is B.")
+        out = self._special("aas", 2, setup, "_run_aas", concept)
         out["settings"].insert(0, f"λ2 = isoabsorptive point {iso:.1f} nm; λ1 = {w1:.1f} nm "
                                   "where B has the same absorbance")
         return out
@@ -862,7 +1128,12 @@ class Guide:
             d.am_divc.setValue(1.0)
             check_only(d.am_std, self._std_ids("A", "B"))
             check_only(d.am_mix, self.mix["Binary A + B"])
-        out = self._special("am", 3, setup, "_run_am")
+        concept = self.concept_ratio(
+            "am", "A", unit, [("iso", iso)], [("plateau → B", (310.0, 350.0))],
+            caption="Why it works — divided by B at 1 µg/mL, B becomes a flat line equal to its "
+                    "concentration; at the isoabsorptive point the ratio equals A + B. Plateau → "
+                    "B, iso − plateau → A.", label="B (1 µg/mL)")
+        out = self._special("am", 3, setup, "_run_am", concept, unit)
         out["settings"].insert(0, f"Divisor: unit-concentration B (Normalize → concentration); "
                                   f"iso {iso:.1f} nm; plateau 310–350 nm")
         return out
@@ -877,7 +1148,13 @@ class Guide:
             check_only(d.iam_xs, self._std_ids("A"))
             check_only(d.iam_ys, self._std_ids("B"))
             check_only(d.iam_mix, self.mix["Binary A + B"])
-        return self._special("iam", 4, setup, "_run_iam")
+        concept = self.concept_ratio(
+            "iam", "A", self.ids["B unit"], [("λ for A", 245.0)],
+            [("plateau → B", (310.0, 350.0))],
+            caption="Why it works — divided by B at 1 µg/mL, B is a flat line equal to C_B "
+                    "(plateau); at 245 nm the ratio is C_B + r·C_A, with r = a_A/a_B from the A "
+                    "standards.", label="B (1 µg/mL)")
+        return self._special("iam", 4, setup, "_run_iam", concept)
 
     def hpsam(self):
         tid = self.trial["Binary A + B"]
@@ -902,7 +1179,39 @@ class Guide:
         d._run_h()
         img = self.shot(d, "hpsam")
         r = d.last[1]
-        return {"image": img,
+        fig, (a1, a2) = self._fig(2)
+        added = [0, 4, 8, 12]
+        for col, sid, add in zip(["#2a78d6", "#3a9a5b", "#d6862a", "#9b59b6"], ids, added):
+            sp = self.p.spectrum(sid)
+            a1.plot(sp.wavelengths, sp.values, color=col, lw=1.5, label=f"sample + {add} A")
+        self._marks(a1, [("λ1", 245.0), ("λ2", w2)])
+        a1.set_title("Sample with standard additions of A", fontsize=10)
+        a1.set_ylabel("Absorbance")
+        a1.legend(frameon=False, fontsize=8)
+        a1.set_xlim(200, 320)
+        xs = np.array([-r["X"] - 1, 13.0])
+        for lab, ln, col in (("at λ1", r["line1"], "#2a78d6"), ("at λ2", r["line2"], "#d6862a")):
+            sps = self.p.spectra(ids)
+            lam = 245.0 if lab == "at λ1" else w2
+            a2.plot(added, [sp.value_at(lam) for sp in sps], "o", color=col)
+            a2.plot(xs, ln["slope"] * xs + ln["intercept"], color=col, label=lab)
+        a2.plot([-r["X"]], [r["A_H"]], "s", color="#222", ms=8, label="H point")
+        a2.axvline(0, color="#999", lw=0.8)
+        a2.set_xlabel("A added (µg/mL)")
+        a2.set_ylabel("Absorbance")
+        a2.set_title("The two addition lines cross at H(−C_A, A_B)", fontsize=10)
+        a2.legend(frameon=False, fontsize=8)
+        images = [self._save_fig(fig, "hpsam", (
+            "Why it works — B absorbs the same at λ1 and λ2, so it shifts both lines by the "
+            "same amount; the lines therefore cross at the x-value −C_A, whatever B's "
+            "concentration.")),
+            (img, "*Binary two-signal methods → Standard addition: H-point*: analyte, λ1, λ2 "
+                  "and the sample with its additions (A concentration = amount added).")]
+        return {"images": images,
+                "data": {"sheets": {"Samples": ids},
+                         "note": "In the Samples sheet the A value of each spectrum is the "
+                                 "amount of A ADDED (0 = the sample alone); the sample itself "
+                                 "contains A 6 and B 12 µg/mL."},
                 "settings": ["Sample: A 6 µg/mL + B 12 µg/mL; additions of A: 0, 4, 8, 12 µg/mL",
                              f"λ1 = 245 nm, λ2 = {w2:.1f} nm (B equal, finder)"],
                 "headers": ["Quantity", "Value"],
@@ -925,7 +1234,32 @@ class Guide:
         taken = [[self.p.record(i).concentrations.get(c) for c in comps] for i in data["ids"]]
         res = self.table(comps, names, data["found"], taken)
         m = d.fitted[0]
-        return {"image": img, "settings": [m.describe()], **res}
+        if isinstance(m, uv.AmplitudeCentering):
+            marks = [("λc", m.wavelength)] + [(f"λ2 {c}", df["w2"])
+                                               for c, df in m.differences.items()]
+            spans = [(f"plateau → {m.divisor_compound}", m.plateau)] if m.plateau else []
+            concept = self.concept_ratio(
+                key, comps[0], m.divisor, marks, spans, label=f"{m.divisor_compound}′",
+                caption="Why it works — in the ratio spectrum the divisor compound "
+                        f"({m.divisor_compound}) is a flat constant. Every compound is read at "
+                        "the same λc: from the plateau, from an amplitude difference at a pair "
+                        "where the others are equal (they cancel), or as what is left after "
+                        "subtracting the others.")
+            divisor = [m.divisor]
+        else:
+            concept = self.concept_zero(
+                key, comps[0], [(f"{c}", w) for c, w in m.order],
+                caption="Why it works — at each marked wavelength the compound named there is "
+                        "added to those already resolved (first: absorbs alone; second: "
+                        "overlapped only by the first; …); their known contributions are "
+                        "subtracted step by step.")
+            divisor = []
+        images = [concept, (img, f"*Methods → Progressive resolution → {d.tabs.tabText(tab)}*: "
+                                 "the settings, the standards and mixtures used, and the "
+                                 "results with recoveries. *Save method* stores it for reuse.")]
+        wb = {"sheets": {"Standards": sorted(self._std_ids(*comps)), "Divisor": divisor,
+                         "Mixtures": data["ids"]}}
+        return {"images": images, "data": wb, "settings": [m.describe()], **res}
 
     def _ac(self, d, comps, divisor, divc, lam, plateau=None, rows=(), sub=None, unified=False):
         for i in range(d.ac_comps.count()):
@@ -1039,6 +1373,19 @@ class Guide:
         d._fit()
         d._predict()
         img = self.shot(d, key)
+        marks, spans = [], []
+        for sg in d.model.signals:
+            q = sg["params"]
+            if sg["kind"] == "area":
+                spans.append(("area", (q["w1"], q["w2"])))
+            else:
+                marks.append(("λ", q["w1"]))
+        concept = self.concept_zero(
+            key, comps[0], marks, spans,
+            caption="Why it works — each marked signal of the mixture is the sum of every "
+                    "compound's contribution (absorptivity × concentration); with one signal per "
+                    "compound (or more) the system of equations is solved for all "
+                    "concentrations at once.")
         pr = d.predictions
         names = [self.p.record(i).name for i in pr["ids"]]
         taken = [[self.p.record(i).concentrations.get(c) for c in pr["compounds"]]
@@ -1047,8 +1394,13 @@ class Guide:
         sig = [f"{s['kind']} {s['params']['w1']:g}" + (f"–{s['params']['w2']:g}"
                                                         if s["kind"] == "area" else "") + " nm"
                for s in d.model.signals]
-        return {"image": img, "settings": ["Signals: " + "; ".join(sig),
-                                           d.summary.text().split("\n")[0]], **res}
+        return {"images": [concept, (img, "*Methods → Equation methods*: compounds, signals, "
+                                          "the absorptivity matrix K after *Fit* (top right) "
+                                          "and the results after *Determine*.")],
+                "data": {"sheets": {"Standards": sorted(self._std_ids(*comps)),
+                                    "Mixtures": pr["ids"]}},
+                "settings": ["Signals: " + "; ".join(sig), d.summary.text().split("\n")[0]],
+                **res}
 
     def vierordt(self):
         return self._equations("vierordt", ["A", "B"], [["amplitude", "245", ""],
@@ -1065,9 +1417,14 @@ class Guide:
     def zc(self):
         zcs = self.zero_crossing("B", 230, 260, [{"op": "derivative", "params": self.D1}])
         lam = round(zcs[0], 1)
-        return self.univariate("zc", "A", "Zero-crossing derivative (D1)",
-                               params={0: {"scaling": 10.0}}, meas={"w1": lam},
-                               notes=[f"Finder: B's D1 crosses zero at {lam} nm."])
+        out = self.univariate("zc", "A", "Zero-crossing derivative (D1)",
+                              params={0: {"scaling": 10.0}}, meas={"w1": lam},
+                              notes=[f"Finder: B's D1 crosses zero at {lam} nm."])
+        out["images"].insert(1, self.finder_shot(
+            "zc", self.ids["B′ D1"], self.ids["B′ D1"], "_zero", 230, 260,
+            "spectrum A = the D1 spectrum of B′ (made once with *Process → Derivative*), "
+            f"range 230–260 nm → *Zero-crossing points of A*: {lam} nm."))
+        return out
 
     def p2p(self):
         return self.univariate("p2p", "B", "Derivative peak-to-peak", params={0: {"scaling": 10.0}},
@@ -1163,8 +1520,13 @@ class Guide:
                                notes=[f"Finder: Y/Z′ equal at {lam:g} and {w2:.1f} nm."])
 
     def cv(self):
-        return self.univariate("cv", "B", "Ratio plateau / constant value (Y)",
-                               refs={0: {"reference": "B′"}}, meas={"w1": 310.0, "w2": 350.0})
+        out = self.univariate("cv", "B", "Ratio plateau / constant value (Y)",
+                              refs={0: {"reference": "B′"}}, meas={"w1": 310.0, "w2": 350.0})
+        out["images"].insert(1, self.finder_shot(
+            "cv", self.ids["Mix ÷ B′"], self.ids["Mix ÷ B′"], "_plateau", 300, 360,
+            "spectrum A = a mixture divided by B′ (*Process → Divide by spectrum*), range "
+            "300–360 nm → *Plateau regions of A*: the flat region used for the constant."))
+        return out
 
     def concval(self):
         return self.univariate("concval", "B",
@@ -1248,7 +1610,7 @@ class Guide:
             it = d.comps.item(i)
             it.setCheckState(Qt.Checked if it.text() in ("X", "Y", "Z") else Qt.Unchecked)
         d.ranges.setText("220-390")
-        rows, img = [], None
+        rows = []
         for model in ("CLS", "ILS", "PCR", "PLS2", "MCR-ALS", "ANN", "SVR"):
             d.mtype.setCurrentText(model)
             if model in ("PCR", "PLS2"):
@@ -1257,9 +1619,19 @@ class Guide:
                 d.wls.setText("240, 255, 275, 290, 355")
             d._fit()
             if model == "PLS2":
+                d.tabs.setCurrentIndex(0)
+                shots = [(self.shot(d, "chemo_1", 900, keep=True),
+                          "Step 1 — *Cross-validate* (PLS2): RMSECV against the number of "
+                          "components for each compound; the suggested number is set "
+                          "automatically.")]
                 d.tabs.setCurrentIndex(1)
-                img = self.shot(d, "chemo")
-                d.show()
+                shots.append((self.shot(d, "chemo_2", 900, keep=True),
+                              "Step 2 — *Fit + predict*: predicted vs actual concentrations of "
+                              "the validation mixtures, with RMSEP and recoveries."))
+                d.tabs.setCurrentIndex(3)
+                shots.append((self.shot(d, "chemo_3", 900, keep=True),
+                              "Step 3 — outlier check: Hotelling T² vs Q residuals with 95/99 % "
+                              "limits; flagged spectra can be excluded with one click."))
             recs = {}
             for r in range(d.results.rowCount()):
                 for j, c in enumerate(("X", "Y", "Z")):
@@ -1270,7 +1642,24 @@ class Guide:
                                   if model in ("PCR", "PLS2") else "")]
                         + [f"{describe(recs[c])['mean']:.2f} ± {describe(recs[c])['sd']:.2f}"
                            for c in ("X", "Y", "Z")])
-        return {"image": img,
+        fig, (a1, a2) = self._fig(2)
+        for sp in self.p.spectra(train):
+            a1.plot(sp.wavelengths, sp.values, color="#8aa9d6", lw=0.8)
+        a1.set_title("Training set: 25 mixtures of a calibration design", fontsize=10)
+        a1.set_ylabel("Absorbance")
+        cs = [self.p.record(i).concentrations for i in train]
+        a2.scatter([c["X"] for c in cs], [c["Y"] for c in cs], c=[c["Z"] for c in cs],
+                   cmap="viridis", s=40)
+        a2.set_xlabel("X (µg/mL)")
+        a2.set_ylabel("Y (µg/mL)")
+        a2.set_title("Design: 5 levels per compound, uncorrelated (colour = Z)", fontsize=10)
+        concept = self._save_fig(fig, "chemo", (
+            "Why it works — the model learns from many mixtures whose composition varies "
+            "independently for each compound how the WHOLE spectrum changes with each "
+            "concentration; it then predicts all compounds of a new spectrum at once."))
+        return {"images": [concept] + shots,
+                "data": {"sheets": {"Calibration": train,
+                                    "Mixtures": self.mix["Ternary X + Y + Z"]}},
                 "settings": ["Training set: 25-mixture Brereton design (Tools → Calibration "
                              "design), 220–390 nm; validation: the 5 laboratory mixtures"],
                 "headers": ["Model", "X recovery %", "Y recovery %", "Z recovery %"],
@@ -1295,10 +1684,32 @@ class Guide:
         d.tabs.setCurrentIndex(2)
         img = self.shot(d, "stdadd")
         sa = d.last[2]
+        fig, (ax,) = self._fig(1)
+        add = [r["added"] for r in sa["rows"]]
+        found = [r["found"] for r in sa["rows"]]
+        reg = sa["regression"]
+        xs = np.array([-sa["extrapolated"] - 0.5, max(add) + 1])
+        ax.plot(add, found, "o", color="#2a78d6")
+        ax.plot(xs, reg["slope"] * xs + reg["intercept"], color="#2a78d6")
+        ax.axvline(0, color="#999", lw=0.8)
+        ax.axhline(0, color="#999", lw=0.8)
+        ax.plot([-sa["extrapolated"]], [0], "s", color="#222")
+        ax.set_xlabel("A added (µg/mL)")
+        ax.set_ylabel("A found (µg/mL)")
+        ax.set_title("Found vs added: slope ≈ 1 means 100 % recovery", fontsize=10)
+        concept = self._save_fig(fig, "stdadd", (
+            "Why it works — each addition should raise the found amount by exactly the amount "
+            "added (slope 1); the line crosses zero at minus the amount already in the sample."))
         rows = [[r["name"], f"{r['added']:g}", f"{r['found']:.3f}",
                  "" if r["recovered"] is None else f"{r['recovered']:.3f}",
                  "" if r["recovery"] is None else f"{r['recovery']:.2f}"] for r in sa["rows"]]
-        return {"image": img,
+        return {"images": [concept, (img, "*Standard addition…* in the Univariate dialog with a "
+                                          "calibrated method: each spiked sample, the amount "
+                                          "recovered and its recovery.")],
+                "data": {"sheets": {"Standards": sorted(self._std_ids("A")),
+                                    "Divisor": [self.ids["B′"]], "Samples": self.spiked},
+                         "note": "In the Samples sheet the A value of each spectrum is the "
+                                 "amount of A ADDED to the sample (0 = the sample alone)."},
                 "settings": ["Method: ratio difference for A (÷ B′, 245 − 275 nm)",
                              f"A in the sample: {sa['sample']:.3f} µg/mL (true 6); "
                              f"extrapolated {sa['extrapolated']:.3f}"],
@@ -1327,6 +1738,191 @@ class Guide:
 
 
 # --------------------------------------------------------------------------- #
+# Sample Excel workbooks
+# --------------------------------------------------------------------------- #
+SHEET_LABEL = {"Standards": "Std", "Divisor": "Divisor", "Mixtures": "Mix", "Samples": "Sample",
+               "Calibration": "Train"}
+
+
+def workbook_name(guide: "Guide", rid: int, sheet: str, k: int) -> str:
+    """Column title that 'Fill concentrations from names' understands."""
+    rec = guide.p.record(rid)
+    if rec.kind == "derived":
+        if "unit concentration" in rec.name:
+            c = next(c for c, v in rec.concentrations.items() if v)
+            return f"Unit divisor: {c} 1"
+        return "Second divisor: D1 of the Z/Y ratio"
+    comps = [c for c in SYSTEMS[SYSTEM_OF[next(iter(rec.concentrations))]]["pure"]
+             if c in rec.concentrations]
+    conc = ", ".join(f"{c} {rec.concentrations[c]:g}" for c in comps)
+    label = SHEET_LABEL.get(sheet, sheet)
+    if sheet == "Calibration":
+        label = f"Train {k}"
+    return f"{label}: {conc}"
+
+
+def write_workbook(path: Path, guide: "Guide", e: "Entry") -> None:
+    import openpyxl
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+    r, data = e.result, e.result.get("data") or {}
+    bold, head = Font(bold=True), PatternFill("solid", fgColor="DCE6F2")
+    wb = openpyxl.Workbook()
+    info = wb.active
+    info.title = "_Read me"
+    names: dict[int, str] = {}
+    sheets_written = []
+    # spectra sheets (raw spectra by role; processed divisors on their own sheet)
+    groups: list[tuple[str, list[int]]] = []
+    for sheet, ids in data.get("sheets", {}).items():
+        raw = [i for i in ids if guide.p.record(i).kind == "raw"]
+        der = [i for i in ids if guide.p.record(i).kind == "derived"]
+        if raw:
+            groups.append((sheet, raw))
+        for j, i in enumerate(der):
+            groups.append((f"Divisor (processed{'' if j == 0 else f' {j + 1}'})", [i]))
+    for sheet, ids in groups:
+        ws = wb.create_sheet(sheet)
+        spectra = guide.p.spectra(ids)
+        ws.cell(1, 1, "Wavelength (nm)").font = bold
+        for j, (rid, sp) in enumerate(zip(ids, spectra), start=2):
+            names[rid] = workbook_name(guide, rid, sheet.split(" (")[0], j - 1)
+            c = ws.cell(1, j, names[rid])
+            c.font, c.fill = bold, head
+            ws.column_dimensions[get_column_letter(j)].width = max(14, len(names[rid]) + 2)
+        x = spectra[0].wavelengths
+        for i, w in enumerate(x, start=2):
+            ws.cell(i, 1, round(float(w), 2))
+            for j, sp in enumerate(spectra, start=2):
+                ws.cell(i, j, round(float(np.interp(w, sp.wavelengths, sp.values)), 6))
+        ws.column_dimensions["A"].width = 16
+        ws.freeze_panes = "B2"
+        sheets_written.append((sheet, len(ids)))
+    # calculation with Excel formulas (single-signal methods)
+    calc = data.get("calc")
+    if calc:
+        ws = wb.create_sheet("_Calculation")
+        ws["A1"] = "Calibration and determination with Excel formulas"
+        ws["A1"].font = Font(bold=True, size=13)
+        ws["A2"] = f"Signal = {calc['signal']} (measured by Spectro on the processed spectra)"
+        ws["A3"] = ("Change nothing here: the formulas show how Spectro turns signals into "
+                    "concentrations. Compare with the _Expected results sheet.")
+        for j, h in enumerate(["Standard", f"{calc['compound']} (µg/mL)", "Signal"], 1):
+            c = ws.cell(5, j, h)
+            c.font, c.fill = bold, head
+        r0 = 6
+        for k, (rid, conc, sig) in enumerate(calc["cal"]):
+            ws.cell(r0 + k, 1, names.get(rid, guide.p.record(rid).name))
+            ws.cell(r0 + k, 2, conc)
+            ws.cell(r0 + k, 3, round(float(sig), 8))
+        r1 = r0 + len(calc["cal"]) - 1
+        rs, ri, rr = r1 + 2, r1 + 3, r1 + 4
+        for row, lab, f in ((rs, "Slope", f"=SLOPE(C{r0}:C{r1},B{r0}:B{r1})"),
+                            (ri, "Intercept", f"=INTERCEPT(C{r0}:C{r1},B{r0}:B{r1})"),
+                            (rr, "Correlation coefficient r", f"=CORREL(B{r0}:B{r1},C{r0}:C{r1})")):
+            ws.cell(row, 1, lab).font = bold
+            ws.cell(row, 2, f)
+        t0 = rr + 3
+        hdr = ["Mixture", f"{calc['compound']} taken (µg/mL)", "Signal",
+               "Found = (Signal − Intercept) / Slope" if not calc["direct"]
+               else "Found = Signal (concentration value)", "Recovery %"]
+        if calc["spike"]:
+            hdr.append(f"Found − added ({calc['spike']:g})")
+        for j, h in enumerate(hdr, 1):
+            c = ws.cell(t0, j, h)
+            c.font, c.fill = bold, head
+            c.alignment = Alignment(wrap_text=True)
+        for k, (rid, taken, sig) in enumerate(calc["test"]):
+            row = t0 + 1 + k
+            ws.cell(row, 1, names.get(rid, guide.p.record(rid).name))
+            ws.cell(row, 2, taken)
+            ws.cell(row, 3, round(float(sig), 8))
+            ws.cell(row, 4, f"=C{row}" if calc["direct"] else f"=(C{row}-$B${ri})/$B${rs}")
+            ws.cell(row, 5, f'=IF(B{row}>0,D{row}/B{row}*100,"")')
+            if calc["spike"]:
+                ws.cell(row, 6, f"=D{row}-{calc['spike']}")
+        t1 = t0 + len(calc["test"])
+        ws.cell(t1 + 2, 4, "Mean recovery %").font = bold
+        ws.cell(t1 + 2, 5, f"=AVERAGE(E{t0 + 1}:E{t1})")
+        ws.cell(t1 + 3, 4, "RSD %").font = bold
+        ws.cell(t1 + 3, 5, f"=STDEV(E{t0 + 1}:E{t1})/AVERAGE(E{t0 + 1}:E{t1})*100")
+        for col, w in zip("ABCDEF", (30, 18, 14, 26, 14, 16)):
+            ws.column_dimensions[col].width = w
+    # expected results
+    ws = wb.create_sheet("_Expected results")
+    ws["A1"] = f"What Spectro gives for this example — {e.title}"
+    ws["A1"].font = Font(bold=True, size=13)
+    row = 3
+    for line in r.get("settings", []):
+        ws.cell(row, 1, line.replace("*", ""))
+        row += 1
+    row += 1
+    for j, h in enumerate(r.get("headers", []), 1):
+        c = ws.cell(row, j, h)
+        c.font, c.fill = bold, head
+    for rr_ in r.get("rows", []):
+        row += 1
+        for j, v in enumerate(rr_, 1):
+            try:
+                ws.cell(row, j, float(v))
+            except (TypeError, ValueError):
+                ws.cell(row, j, v)
+    row += 2
+    for line in r.get("summary", []):
+        ws.cell(row, 1, line).font = bold
+        row += 1
+    ws.column_dimensions["A"].width = 34
+    # read me
+    b = BEGINNER.get(e.key, {})
+    comps = sorted({c for g in groups for i in g[1]
+                    for c in guide.p.record(i).concentrations},
+                   key=lambda c: "ABXYZUVW".index(c))
+    lines = [
+        (f"{e.title}", Font(bold=True, size=14)),
+        (f"Family: {CATEGORIES[e.category]}", Font(italic=True)),
+        ("", None),
+        ("The idea in plain words", bold), (b.get("plain", e.principle), None),
+        ("", None),
+        ("What is in this workbook", bold)]
+    lines += [(f"• Sheet '{n}': {k} spectr{'um' if k == 1 else 'a'} (wavelength in column A, "
+               "one spectrum per column; the column title holds the concentrations)", None)
+              for n, k in sheets_written]
+    if calc:
+        lines.append(("• Sheet '_Calculation': the calibration and the results done with Excel "
+                      "formulas, so every number can be followed.", None))
+    lines += [("• Sheet '_Expected results': what Spectro gives for this example.", None),
+              ("• Sheets whose name starts with _ are notes; Spectro does not import them.",
+               None)]
+    if data.get("note"):
+        lines.append(("• " + data["note"], None))
+    lines += [("", None), ("How to use it in Spectro", bold),
+              ("1. File → New project…", None),
+              (f"2. Edit → Compounds… and add: {', '.join(comps)}", None),
+              ("3. File → Import spectra… → Add files… → choose this workbook.", None),
+              ("4. Press 'Fill concentrations from names'. The Role column is filled from the "
+               "sheet names (Standards → standard, Mixtures → mixture, …). Press Import.", None)]
+    lines += [(f"{k}. {st.replace('*', '')}", None) for k, st in enumerate(e.steps, 5)]
+    lines += [("   (In these steps X is the compound being determined and Y, Z the interfering "
+               f"ones — in this workbook the compounds are {', '.join(comps)}.)", None)]
+    lines += [(f"{len(e.steps) + 5}. Compare your results with the sheet '_Expected results'.",
+               None),
+              ("", None), ("Settings used in this example", bold)]
+    lines += [("• " + x.replace("*", ""), None) for x in r.get("settings", [])]
+    lines += [("", None), ("Checks / common mistakes", bold), (b.get("check", ""), None),
+              ("", None),
+              ("The spectra are simulated (Gaussian bands + 0.0004 AU noise) to show the method "
+               "clearly; they are not measured data. See docs/methods/README.md for the full "
+               "guide with screenshots.", Font(italic=True, color="666666"))]
+    for i, (text, font) in enumerate(lines, 1):
+        c = info.cell(i, 1, text)
+        c.alignment = Alignment(wrap_text=True, vertical="top")
+        if font:
+            c.font = font
+    info.column_dimensions["A"].width = 120
+    wb.save(path)
+
+
+# --------------------------------------------------------------------------- #
 # Output
 # --------------------------------------------------------------------------- #
 def md_table(headers, rows):
@@ -1335,21 +1931,35 @@ def md_table(headers, rows):
     return out
 
 
-def write_markdown(out: Path, entries: list[Entry]) -> None:
-    md = ["# Spectro — method guide", "",
-          "How to apply every spectrophotometric method in Spectro, with a worked example and a "
-          "screenshot of the method being applied. The examples use the simulated guide "
-          "systems below (Gaussian bands, 0.0004 AU noise) — not measured data — and every "
-          "number was produced by the app itself when this guide was generated "
-          "(`python tools/method_guide.py`).", "",
+def _images(r: dict) -> list[tuple[str, str]]:
+    if r.get("images"):
+        return r["images"]
+    return [(r["image"], "")] if r.get("image") else []
+
+
+INTRO = ("How to apply every spectrophotometric method in Spectro — written for "
+         "beginners. Each method has: the idea in plain words, the principle, what you need "
+         "to measure, step-by-step instructions, checks and common mistakes, a worked example "
+         "with a 'why it works' figure and screenshots of every step, and a **sample Excel "
+         "workbook** with the example's spectra (import it and reproduce the result). The "
+         "examples use simulated systems (Gaussian bands, 0.0004 AU noise) — not measured "
+         "data — and every number was produced by the app itself when this guide was "
+         "generated (`python tools/method_guide.py`).")
+
+
+def write_markdown(out: Path, entries: list[Entry], primer_images=()) -> None:
+    md = ["# Spectro — method guide", "", INTRO, "",
           "**Tip:** *Tools → Method optimizer* tries most of these methods automatically on your "
           "standards and ranks them; this guide explains what each one does and how to set it "
-          "up by hand.", "", "## Guide systems", ""]
+          "up by hand.", "", "## Getting started", "", PRIMER.strip(), ""]
+    for img, cap in primer_images:
+        md += [f"![{cap}]({img})", "", f"*{cap}*", ""]
+    md += ["### 6. The guide systems", ""]
     for name, s in SYSTEMS.items():
         md.append(f"* **{name}** — {s['about']} Standards "
                   f"{s['levels'][0]}–{s['levels'][-1]} µg/mL; divisors "
                   + ", ".join(f"{c}′ = {v} µg/mL" for c, v in s["divisors"].items()) + ".")
-    md += ["", "![Pure spectra of the guide systems](systems.png)", "", "## Contents", ""]
+    md += ["", "![Pure spectra of the guide systems](img/systems.png)", "", "## Contents", ""]
     for cat, title in CATEGORIES.items():
         items = [e for e in entries if e.category == cat]
         if items:
@@ -1361,59 +1971,135 @@ def write_markdown(out: Path, entries: list[Entry]) -> None:
             continue
         md += ["", f"## {title}", "", DESCRIPTIONS[cat], ""]
         for e in items:
-            md += [f'<a id="{e.key}"></a>', "", f"### {e.title}", "",
-                   f"**Principle.** {e.principle}", "", f"**Use when.** {e.when}", "",
-                   "**How to apply in Spectro**", ""]
-            md += [f"{i}. {s}" for i, s in enumerate(e.steps, 1)]
+            b = BEGINNER.get(e.key, {})
+            md += [f'<a id="{e.key}"></a>', "", f"### {e.title}", ""]
+            if b.get("plain"):
+                md += [f"**In plain words.** {b['plain']}", ""]
+            md += [f"**Principle.** {e.principle}", "", f"**Use when.** {e.when}", ""]
+            if b.get("need"):
+                md += [f"**What you need.** {b['need']}", ""]
+            md += ["**How to apply in Spectro**", ""]
+            md += [f"{i}. {st}" for i, st in enumerate(e.steps, 1)]
+            if b.get("check"):
+                md += ["", f"**Checks and common mistakes.** {b['check']}"]
             r = e.result
             if r.get("error"):
                 md += ["", f"*Example could not be generated: {r['error']}*"]
             elif r:
-                md += ["", "**Example**", ""] + [f"* {s}" for s in r.get("settings", [])]
+                md += ["", "**Worked example**", ""]
+                if (out / "data" / f"{e.key}.xlsx").exists():
+                    md += [f"📊 **Sample data:** [data/{e.key}.xlsx](data/{e.key}.xlsx) — "
+                           "import it (see *Getting started → 4*) and reproduce the numbers "
+                           "below.", ""]
+                md += [f"* {x}" for x in r.get("settings", [])]
+                imgs = _images(r)
+                if imgs and imgs[0][0].endswith("_concept.png"):
+                    md += ["", f"![{e.title} — why it works]({imgs[0][0]})", "",
+                           f"*{imgs[0][1]}*"]
+                    imgs = imgs[1:]
                 if r.get("rows"):
                     md += [""] + md_table(r["headers"], r["rows"])
                 if r.get("summary"):
                     md += ["", "Result: " + "; ".join(r["summary"]) + "."]
-                if r.get("image"):
-                    md += ["", f"![{e.title}]({r['image']})"]
+                for img, cap in imgs:
+                    md += ["", f"![{e.title}]({img})", ""] + ([f"*{cap}*"] if cap else [])
             if e.refs:
                 md += ["", "*Literature:* " + "; ".join(REFS.get(k.strip(), k.strip())
                                                         for k in e.refs.split(","))]
     (out / "README.md").write_text("\n".join(md) + "\n", encoding="utf-8")
 
 
-def write_html(out: Path, entries: list[Entry]) -> None:
-    e_ = html.escape
+def _inline(t: str) -> str:
+    import re
+    t = html.escape(t)
+    t = re.sub(r"`(.+?)`", r"<code>\1</code>", t)
+    t = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t)
+    return re.sub(r"\*(.+?)\*", r"<i>\1</i>", t)
 
-    def inline(t: str) -> str:
-        import re
-        t = e_(t)
-        t = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t)
-        return re.sub(r"\*(.+?)\*", r"<i>\1</i>", t)
+
+def md_to_html(text: str) -> str:
+    """Enough Markdown for the primer: ### headings, lists, tables, paragraphs."""
+    out, para, lst, table = [], [], None, []
+
+    def flush():
+        nonlocal para, lst, table
+        if para:
+            out.append("<p>" + _inline(" ".join(para)) + "</p>")
+        if lst:
+            tag, items = lst
+            out.append(f"<{tag}>" + "".join(f"<li>{_inline(i)}</li>" for i in items)
+                       + f"</{tag}>")
+        if table:
+            rows = [[c.strip() for c in r.strip("|").split("|")] for r in table
+                    if not set(r.replace("|", "").strip()) <= {"-"}]
+            out.append("<table>" + "".join(
+                "<tr>" + "".join(f"<{'th' if k == 0 else 'td'}>{_inline(c)}"
+                                 f"</{'th' if k == 0 else 'td'}>" for c in row) + "</tr>"
+                for k, row in enumerate(rows)) + "</table>")
+        para, lst, table = [], None, []
+    import re
+    for line in text.splitlines():
+        st = line.strip()
+        if not st:
+            flush()
+        elif st.startswith("### "):
+            flush()
+            out.append(f"<h3>{_inline(st[4:])}</h3>")
+        elif st.startswith("|"):
+            if para or lst:
+                flush()
+            table.append(st)
+        elif st.startswith("* ") or re.match(r"\d+\. ", st):
+            tag = "ul" if st.startswith("* ") else "ol"
+            item = st[2:] if tag == "ul" else st.split(". ", 1)[1]
+            if para or table:
+                flush()
+            if lst and lst[0] == tag:
+                lst[1].append(item)
+            else:
+                flush()
+                lst = (tag, [item])
+        elif lst and line.startswith("  "):
+            lst[1][-1] += " " + st
+        else:
+            if lst or table:
+                flush()
+            para.append(st)
+    flush()
+    return "".join(out)
+
+
+def write_html(out: Path, entries: list[Entry], primer_images=()) -> None:
+    e_ = html.escape
     parts = ["<!doctype html><html><head><meta charset='utf-8'>"
              "<meta name='viewport' content='width=device-width,initial-scale=1'>"
              "<title>Spectro method guide</title><style>"
              ":root{--bg:#fcfcfb;--fg:#0b0b0b;--mut:#52514e;--line:#e3e2de;--card:#fff;"
-             "--acc:#2a78d6}"
+             "--acc:#2a78d6;--soft:#eef4fc}"
              "@media (prefers-color-scheme:dark){:root{--bg:#161615;--fg:#eceae6;--mut:#b5b3ad;"
-             "--line:#34332f;--card:#1f1f1d;--acc:#6aa5ee}}"
+             "--line:#34332f;--card:#1f1f1d;--acc:#6aa5ee;--soft:#1d2a3a}}"
              "body{font-family:Segoe UI,Arial,sans-serif;margin:0;background:var(--bg);"
-             "color:var(--fg);line-height:1.5}main{max-width:1100px;margin:auto;padding:24px}"
+             "color:var(--fg);line-height:1.55}main{max-width:1100px;margin:auto;padding:24px}"
              "nav{background:var(--card);border:1px solid var(--line);border-radius:8px;"
              "padding:12px 18px}h2{border-bottom:2px solid var(--acc);padding-bottom:4px;"
              "margin-top:48px}section{background:var(--card);border:1px solid var(--line);"
-             "border-radius:8px;padding:6px 20px 16px;margin:20px 0}img{max-width:100%;"
-             "border:1px solid var(--line);border-radius:6px}table{border-collapse:collapse;"
-             "font-size:13px;margin:8px 0;display:block;overflow-x:auto}td,th{border:1px solid "
-             "var(--line);padding:3px 8px;text-align:right}td:first-child,th:first-child"
-             "{text-align:left}.mut{color:var(--mut)}a{color:var(--acc)}</style></head><body>"
-             "<main><h1>Spectro — method guide</h1>"
-             "<p class='mut'>How to apply every method, with a worked example and a screenshot "
-             "of the method being applied. Simulated guide systems (not measured data); every "
-             "number was produced by the app when the guide was generated.</p><ul>"]
+             "border-radius:8px;padding:6px 20px 16px;margin:20px 0}.plain{background:var(--soft);"
+             "border-left:4px solid var(--acc);padding:8px 12px;border-radius:4px}"
+             "figure{margin:14px 0}figcaption{color:var(--mut);font-size:14px}"
+             "img{max-width:100%;border:1px solid var(--line);border-radius:6px}"
+             "table{border-collapse:collapse;font-size:13px;margin:8px 0;display:block;"
+             "overflow-x:auto}td,th{border:1px solid var(--line);padding:3px 8px;text-align:left}"
+             ".mut{color:var(--mut)}a{color:var(--acc)}.data{font-weight:600}"
+             "</style></head><body><main><h1>Spectro — method guide</h1>"
+             f"<p class='mut'>{_inline(INTRO)}</p><h2>Getting started</h2>",
+             md_to_html(PRIMER)]
+    for img, cap in primer_images:
+        parts.append(f"<figure><img loading='lazy' src='{img}' alt='{e_(cap)}'>"
+                     f"<figcaption>{_inline(cap)}</figcaption></figure>")
+    parts.append("<h3>6. The guide systems</h3><ul>")
     for name, s in SYSTEMS.items():
         parts.append(f"<li><b>{e_(name)}</b> — {e_(s['about'])}</li>")
-    parts.append("</ul><img src='systems.png' alt='Pure spectra of the guide systems'><nav>")
+    parts.append("</ul><img src='img/systems.png' alt='Pure spectra of the guide systems'><nav>")
     for cat, title in CATEGORIES.items():
         items = [e for e in entries if e.category == cat]
         if items:
@@ -1426,25 +2112,43 @@ def write_html(out: Path, entries: list[Entry]) -> None:
             continue
         parts.append(f"<h2>{e_(title)}</h2><p class='mut'>{e_(DESCRIPTIONS[cat])}</p>")
         for e in items:
-            r = e.result
-            parts.append(f"<section id='{e.key}'><h3>{e_(e.title)}</h3>"
-                         f"<p><b>Principle.</b> {inline(e.principle)}</p>"
-                         f"<p><b>Use when.</b> {inline(e.when)}</p><b>How to apply</b><ol>"
-                         + "".join(f"<li>{inline(s)}</li>" for s in e.steps) + "</ol>")
+            r, b = e.result, BEGINNER.get(e.key, {})
+            parts.append(f"<section id='{e.key}'><h3>{e_(e.title)}</h3>")
+            if b.get("plain"):
+                parts.append(f"<p class='plain'><b>In plain words.</b> {_inline(b['plain'])}</p>")
+            parts.append(f"<p><b>Principle.</b> {_inline(e.principle)}</p>"
+                         f"<p><b>Use when.</b> {_inline(e.when)}</p>")
+            if b.get("need"):
+                parts.append(f"<p><b>What you need.</b> {_inline(b['need'])}</p>")
+            parts.append("<b>How to apply</b><ol>" + "".join(
+                f"<li>{_inline(st)}</li>" for st in e.steps) + "</ol>")
+            if b.get("check"):
+                parts.append(f"<p><b>Checks and common mistakes.</b> {_inline(b['check'])}</p>")
             if r.get("error"):
                 parts.append(f"<p><i>Example could not be generated: {e_(r['error'])}</i></p>")
             elif r:
-                parts.append("<b>Example</b><ul>" + "".join(
-                    f"<li>{inline(s)}</li>" for s in r.get("settings", [])) + "</ul>")
+                parts.append("<h4>Worked example</h4>")
+                if (out / "data" / f"{e.key}.xlsx").exists():
+                    parts.append(f"<p class='data'>📊 Sample data: <a href='data/{e.key}.xlsx'>"
+                                 f"{e.key}.xlsx</a> — import it and reproduce the numbers.</p>")
+                parts.append("<ul>" + "".join(f"<li>{_inline(x)}</li>"
+                                              for x in r.get("settings", [])) + "</ul>")
+                imgs = _images(r)
+                if imgs and imgs[0][0].endswith("_concept.png"):
+                    parts.append(f"<figure><img loading='lazy' src='{imgs[0][0]}' alt='concept'>"
+                                 f"<figcaption>{_inline(imgs[0][1])}</figcaption></figure>")
+                    imgs = imgs[1:]
                 if r.get("rows"):
                     parts.append("<table><tr>" + "".join(f"<th>{e_(h)}</th>"
                                                          for h in r["headers"]) + "</tr>"
-                                 + "".join("<tr>" + "".join(f"<td>{e_(str(c))}</td>" for c in row)
-                                           + "</tr>" for row in r["rows"]) + "</table>")
+                                 + "".join("<tr>" + "".join(f"<td>{e_(str(c))}</td>"
+                                                            for c in row) + "</tr>"
+                                           for row in r["rows"]) + "</table>")
                 if r.get("summary"):
                     parts.append(f"<p>Result: {e_('; '.join(r['summary']))}.</p>")
-                if r.get("image"):
-                    parts.append(f"<img loading='lazy' src='{r['image']}' alt='{e_(e.title)}'>")
+                for img, cap in imgs:
+                    parts.append(f"<figure><img loading='lazy' src='{img}' alt='{e_(e.title)}'>"
+                                 f"<figcaption>{_inline(cap)}</figcaption></figure>")
             if e.refs:
                 parts.append("<p class='mut'>Literature: " + e_("; ".join(
                     REFS.get(k.strip(), k.strip()) for k in e.refs.split(","))) + "</p>")
@@ -1469,9 +2173,9 @@ def systems_figure(out: Path) -> None:
         ax.grid(alpha=0.2)
     axes[0].set_ylabel("Absorbance")
     fig.tight_layout()
-    fig.savefig(out / "systems.png", dpi=110)
+    fig.savefig(out / "img" / "systems.png", dpi=110)
     plt.close(fig)
-    compact_png(out / "systems.png")
+    compact_png(out / "img" / "systems.png")
 
 
 def main(argv=None) -> int:
@@ -1499,10 +2203,24 @@ def main(argv=None) -> int:
                 traceback.print_exc()
                 e.result = {"error": str(exc)}
                 failures.append(e.key)
+        for e in ENTRIES:
+            if e.result.get("data"):
+                try:
+                    write_workbook(out / "data" / f"{e.key}.xlsx", guide, e)
+                except Exception:
+                    traceback.print_exc()
+                    failures.append(f"{e.key} (workbook)")
         guide.win.close_project()
+        primer = []
+        if (out / "data" / "rd.xlsx").exists():
+            try:
+                primer = guide.primer_shots(out / "data" / "rd.xlsx", Path(tmp))
+            except Exception:
+                traceback.print_exc()
+                failures.append("primer screenshots")
     entries = [e for e in ENTRIES if not only or e.key in only]
-    write_markdown(out, entries)
-    write_html(out, entries)
+    write_markdown(out, entries, primer)
+    write_html(out, entries, primer)
     print(f"\n{len(entries)} methods → {out / 'README.md'} and index.html")
     if failures:
         print("FAILED:", ", ".join(failures))

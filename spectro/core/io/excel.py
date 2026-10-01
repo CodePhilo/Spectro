@@ -7,6 +7,19 @@ from typing import Any
 
 from spectro.core.io.table import ParseOptions, ParseResult, parse_grid
 
+ROLE_WORDS = ("standard", "calibration", "validation", "mixture", "sample", "blank",
+              "divisor", "unknown", "reference")
+
+
+def role_from_sheet(name: str | None) -> str | None:
+    """'Standards', 'Mixtures', 'Divisor (processed)' → role of the spectra
+    in that sheet; None when the sheet name is not a role."""
+    if not name:
+        return None
+    first = str(name).strip().lower().split()[0] if str(name).strip() else ""
+    first = first.rstrip("s") if first.endswith("s") else first
+    return first if first in ROLE_WORDS else None
+
 
 def _sheets(path: Path) -> list[tuple[str, list[list[Any]]]]:
     if path.suffix.lower() == ".xls":
@@ -29,10 +42,14 @@ def _sheets(path: Path) -> list[tuple[str, list[list[Any]]]]:
 
 def load_excel(path: str | Path, options: ParseOptions | None = None,
                sheet: str | None = None) -> ParseResult:
-    """Parse every sheet that contains spectra (or only ``sheet``)."""
+    """Parse every sheet that contains spectra (or only ``sheet``).
+
+    Sheets whose name starts with an underscore (e.g. ``_Read me``,
+    ``_Calculation``) hold notes and are not imported."""
     path = Path(path)
     options = options or ParseOptions()
-    sheets = [(n, rows) for n, rows in _sheets(path) if sheet is None or n == sheet]
+    sheets = [(n, rows) for n, rows in _sheets(path)
+              if (sheet is None and not str(n).startswith("_")) or n == sheet]
     if not sheets:
         raise ValueError(f"sheet {sheet!r} not found")
     combined: ParseResult | None = None

@@ -113,3 +113,30 @@ def test_tab_delimited_rows_with_spaces_in_names(tmp_path):
                  + "\t".join(["0.3"] * X.size))
     r = load_file(f)
     assert r.spectra[0].name == "V1 PAR 9 CAF 5" and r.spectra[0].x.size == X.size
+
+
+def test_excel_note_sheets_are_skipped_and_sheet_names_give_roles(tmp_path):
+    import openpyxl
+
+    from spectro.core.io import load_file
+    from spectro.core.io.excel import role_from_sheet
+    wb = openpyxl.Workbook()
+    wb.active.title = "_Read me"
+    wb.active["A1"] = "notes, not spectra"
+    for name in ("Standards", "Mixtures"):
+        ws = wb.create_sheet(name)
+        ws.append(["Wavelength", f"{name} 1"])
+        for w in range(200, 211):
+            ws.append([w, 0.1 * (w - 199)])
+    calc = wb.create_sheet("_Calculation")
+    for i in range(5):
+        calc.append([i, i * 2.0])            # numbers that would look like a spectrum
+    path = tmp_path / "s.xlsx"
+    wb.save(path)
+    res = load_file(path)
+    assert [s.metadata["sheet"] for s in res.spectra] == ["Standards", "Mixtures"]
+    assert role_from_sheet("Standards") == "standard"
+    assert role_from_sheet("Mixtures") == "mixture"
+    assert role_from_sheet("Divisor (processed)") == "divisor"
+    assert role_from_sheet("Samples") == "sample"
+    assert role_from_sheet("Sheet1") is None

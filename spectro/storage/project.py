@@ -478,8 +478,10 @@ class Project:
                     options: ParseOptions | None = None, role: str = "",
                     only: list[int] | None = None,
                     concentrations: dict[int, dict[str, float]] | None = None,
-                    names: dict[int, str] | None = None) -> list[int]:
-        """Import spectra from any supported file (raw, immutable)."""
+                    names: dict[int, str] | None = None,
+                    roles: dict[int, str] | None = None) -> list[int]:
+        """Import spectra from any supported file (raw, immutable). ``roles``
+        overrides ``role`` per spectrum (e.g. from the Excel sheet name)."""
         path = Path(path)
         result = load_file(path, options)
         sha = file_sha256(path)
@@ -494,8 +496,8 @@ class Project:
                     s.concentrations = dict(concentrations[i])
                 s.metadata.update({k: v for k, v in result.metadata.items()
                                    if not k.startswith("_")})
-                ids.append(self._insert_spectrum(s, trial_id, "raw", [], [], role,
-                                                 str(path), sha))
+                ids.append(self._insert_spectrum(s, trial_id, "raw", [], [],
+                                                 (roles or {}).get(i, role), str(path), sha))
             self._audit("IMPORT", "file", None,
                         f"Imported {len(ids)} spectra from {path.name}",
                         {"file": str(path), "file_sha256": sha, "layout": result.layout,

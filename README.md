@@ -60,9 +60,12 @@ The same project can be built from the command line with
 
 [`docs/workflows/`](docs/workflows/README.md) shows 26 annotated screenshots of
 the main workflows on the demo project, each with the benefit it brings, and
-[`docs/methods/`](docs/methods/README.md) is the method guide (44 methods, each
-with principle, conditions, step-by-step use, a worked example and a
-screenshot). Both are generated from the running app; regenerate them after
+[`docs/methods/`](docs/methods/README.md) is the method guide for beginners
+(44 methods, each with the idea in plain words, principle, what to measure,
+step-by-step use, checks and common mistakes, a "why it works" figure,
+screenshots of every step, and a sample Excel workbook in
+[`docs/methods/data/`](docs/methods/data) to import and reproduce the
+example; the workbooks also show the calibration as Excel formulas). Both are generated from the running app; regenerate them after
 changing the UI:
 
 ```bash

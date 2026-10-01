@@ -77,6 +77,7 @@ class ImportDialog(Base):
         self.role_cb = QComboBox()
         self.role_cb.addItems(ROLES)
         self.role_cb.setEditable(True)
+        self.role_cb.currentTextChanged.connect(self._default_role)
         for w in (add, clear, QLabel("Layout"), self.layout_cb, QLabel("Decimal"), self.dec_cb,
                   QLabel("Trial"), self.trial_cb, new_trial, QLabel("Role"), self.role_cb):
             top.addWidget(w)
@@ -151,7 +152,8 @@ class ImportDialog(Base):
                 self.results[f] = load_file(f, self._options())
             except Exception as exc:
                 problems.append(f"{Path(f).name}: {exc}")
-        headers = ["Import", "File", "Name", "Points", "Range (nm)"] + self.compounds
+        from spectro.core.io.excel import role_from_sheet
+        headers = ["Import", "File", "Name", "Points", "Range (nm)", "Role"] + self.compounds
         self.table.clear()
         self.table.setColumnCount(len(headers))
         self.table.setHorizontalHeaderLabels(headers)
@@ -169,8 +171,15 @@ class ImportDialog(Base):
                 it.setFlags(it.flags() & ~Qt.ItemIsEditable)
                 self.table.setItem(k, j, it)
             self.table.setItem(k, 2, QTableWidgetItem(s.name))
+            sheet_role = role_from_sheet(s.metadata.get("sheet"))
+            it = QTableWidgetItem(sheet_role or self.role_cb.currentText())
+            it.setData(Qt.UserRole, bool(sheet_role))     # fixed by the sheet name
+            it.setToolTip("Role of this spectrum. Excel sheets named Standards, Mixtures, "
+                          "Divisor, Samples… set it automatically; otherwise the Role chosen "
+                          "above is used. Editable.")
+            self.table.setItem(k, 5, it)
             for j, c in enumerate(self.compounds):
-                self.table.setItem(k, 5 + j, QTableWidgetItem(""))
+                self.table.setItem(k, 6 + j, QTableWidgetItem(""))
         self.table.resizeColumnsToContents()
         layouts = {r.layout for r in self.results.values()}
         msg = f"{len(rows)} spectra in {len(self.results)} files (layout: {', '.join(layouts) or '–'})."
@@ -179,6 +188,13 @@ class ImportDialog(Base):
         self.status.setText(msg)
         if rows:
             self.table.selectRow(0)
+
+    def _default_role(self, role):
+        """The Role above applies to every spectrum whose role is not set by its sheet."""
+        for k in range(self.table.rowCount()):
+            it = self.table.item(k, 5)
+            if it is not None and not it.data(Qt.UserRole):
+                it.setText(role)
 
     def _preview(self):
         rows = sorted({i.row() for i in self.table.selectedIndexes()}) or [0]
@@ -193,7 +209,7 @@ class ImportDialog(Base):
             found = concentrations_from_name(self.table.item(k, 2).text(), self.compounds)
             for j, c in enumerate(self.compounds):
                 if c in found:
-                    self.table.item(k, 5 + j).setText(f"{found[c]:g}")
+                    self.table.item(k, 6 + j).setText(f"{found[c]:g}")
 
     def _import(self):
         if not self.results:
@@ -202,14 +218,15 @@ class ImportDialog(Base):
         per_file: dict[str, dict] = {}
         try:
             for k, (f, i, s) in enumerate(self.rows):
-                d = per_file.setdefault(f, {"only": [], "conc": {}, "names": {}})
+                d = per_file.setdefault(f, {"only": [], "conc": {}, "names": {}, "roles": {}})
                 if self.table.item(k, 0).checkState() != Qt.Checked:
                     continue
                 d["only"].append(i)
                 d["names"][i] = self.table.item(k, 2).text().strip() or s.name
+                d["roles"][i] = self.table.item(k, 5).text().strip()
                 conc = {}
                 for j, c in enumerate(self.compounds):
-                    t = self.table.item(k, 5 + j).text().strip().replace(",", ".")
+                    t = self.table.item(k, 6 + j).text().strip().replace(",", ".")
                     if t:
                         conc[c] = float(t)
                 if conc:
@@ -225,7 +242,7 @@ class ImportDialog(Base):
                 total += len(self.project.import_file(
                     f, self.trial_cb.currentData(), self._options(),
                     role=self.role_cb.currentText().strip(), only=d["only"],
-                    concentrations=d["conc"], names=d["names"]))
+                    concentrations=d["conc"], names=d["names"], roles=d["roles"]))
             except Exception as exc:
                 error(self, f"{Path(f).name}: {exc}")
         self.win.statusBar().showMessage(f"Imported {total} spectra.")
