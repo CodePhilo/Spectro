@@ -129,6 +129,10 @@ class MainWindow(QMainWindow):
         rb = QPushButton("Verify: recompute from raw data")
         rb.clicked.connect(self._replay)
         lv.addWidget(rb)
+        eb = QPushButton("Edit processing…")
+        eb.setToolTip("Change the steps that made this spectrum (a new version is stored)")
+        eb.clicked.connect(self._edit_prop_processing)
+        lv.addWidget(eb)
         self.props.addTab(lw, "Lineage")
         self.p_history = QTableWidget()
         self.props.addTab(self.p_history, "History")
@@ -195,6 +199,8 @@ class MainWindow(QMainWindow):
         m = mb.addMenu("&Process")
         act(m, "&Processing pipeline…", self.process, "Ctrl+P",
             tip="Smoothing, baseline, derivatives, ratio spectra, resolution…")
+        act(m, "&Edit processing of selected spectra…", self.edit_processing, "Ctrl+Shift+P",
+            tip="Change the steps of processed spectra; everything built on them is rebuilt")
 
         m = mb.addMenu("&Methods")
         m.addSection("One compound per method")
@@ -470,12 +476,31 @@ class MainWindow(QMainWindow):
         reason = ask_reason(self, "Save changes to this spectrum's description?")
         if reason is None:
             return
+        before = self.project.record(sid).concentrations
         try:
             self.project.update_spectrum(sid, reason, name=self.p_name.text().strip(),
                                          role=self.p_role.currentText().strip(),
                                          notes=self.p_notes.toPlainText(), concentrations=conc)
         except Exception as exc:
             error(self, exc)
+            return
+        if conc != before:
+            from spectro.ui.dialogs_data import notify_impact
+            notify_impact(self, self.project, [sid] + self.project.descendants(sid),
+                          "Concentrations saved (processed versions of this sample were "
+                          "updated too).")
+
+    def _edit_prop_processing(self) -> None:
+        sid = getattr(self, "_prop_id", None)
+        if sid is None:
+            return
+        from spectro.ui.dialogs_data import ProcessDialog
+        try:
+            dlg = ProcessDialog(self, [sid], edit=True)
+        except Exception as exc:
+            error(self, exc)
+            return
+        dlg.exec()
 
     def _replay(self) -> None:
         sid = getattr(self, "_prop_id", None)
@@ -585,6 +610,18 @@ class MainWindow(QMainWindow):
         ids = self._need_selection()
         if ids:
             self._dialog("dialogs_data", "ProcessDialog", ids)
+
+    def edit_processing(self):
+        ids = self._need_selection()
+        if not ids:
+            return
+        from spectro.ui.dialogs_data import ProcessDialog
+        try:
+            dlg = ProcessDialog(self, ids, edit=True)
+        except Exception as exc:
+            error(self, exc)
+            return
+        dlg.exec()
 
     def audit_viewer(self):
         self._dialog("dialogs_data", "AuditDialog")

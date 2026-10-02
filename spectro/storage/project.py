@@ -529,7 +529,9 @@ class Project:
                        if p.kind == "spectrum"
                        for v in [st.get("params", {}).get(p.name)] if v is not None})
         resolve = self.resolver()
-        name_of = lambda ref: self.record(int(ref)).name  # noqa: E731
+
+        def name_of(ref):
+            return self.record(int(ref)).name
         label = suffix or " → ".join(REGISTRY[st["op"]].label.split(" (")[0] for st in steps)
         out_ids = []
         with self._tx():
@@ -589,9 +591,12 @@ class Project:
             for k, v in changes.items():
                 val = _json(v) if k in ("concentrations", "metadata") else v
                 self.conn.execute(f"UPDATE spectra SET {k}=? WHERE id=?", (val, sid))
+            details = {"before": {k: getattr(rec, k) for k in changes}, "after": changes}
+            if "concentrations" in changes:
+                details["propagated_to"] = self._propagate_concentrations(
+                    {sid: changes["concentrations"]})
             self._audit("EDIT", "spectrum", sid, f"Edited spectrum '{rec.name}': "
-                        + ", ".join(changes), {"before": {k: getattr(rec, k) for k in changes},
-                                               "after": changes}, reason)
+                        + ", ".join(changes), details, reason)
         self._notify("spectrum", sid)
 
     def set_concentrations_bulk(self, values: dict[int, dict[str, float]], reason: str = "") -> None:
@@ -604,12 +609,144 @@ class Project:
                     self.conn.execute("UPDATE spectra SET concentrations=? WHERE id=?",
                                       (_json(conc), sid))
             if before:
+                prop = self._propagate_concentrations({k: values[k] for k in before})
                 self._audit("EDIT", "spectrum", None,
                             f"Edited concentrations of {len(before)} spectra",
                             {"before": {str(k): v for k, v in before.items()},
                              "after": {str(k): values[k] for k in before},
-                             "inputs": list(before)}, reason)
+                             "inputs": list(before), "propagated_to": prop}, reason)
         self._notify("spectrum", None)
+
+    def descendants(self, sid: int, include_references: bool = False) -> list[int]:
+        """Derived spectra made from ``sid`` (through any number of processing
+        steps). By default only the processed versions of the same sample
+        (first parent); with ``include_references`` also spectra that used it
+        as a divisor/reference."""
+        out, todo = [], [int(sid)]
+        live = [r for r in self.records() if r.kind == "derived"]
+        while todo:
+            cur = todo.pop()
+            for r in live:
+                ps = r.parent_ids if include_references else r.parent_ids[:1]
+                if cur in ps and r.id not in out:
+                    out.append(r.id)
+                    todo.append(r.id)
+        return out
+
+    def _propagate_concentrations(self, values: dict[int, dict]) -> list[int]:
+        """Processed versions of a sample carry the sample's concentrations."""
+        done = []
+        for sid, conc in values.items():
+            for d in self.descendants(sid):
+                self.conn.execute("UPDATE spectra SET concentrations=? WHERE id=?",
+                                  (_json(conc), d))
+                done.append(d)
+        return done
+
+    def usage(self, ids) -> dict:
+        """Saved methods and results that use any of ``ids`` (calibration
+        spectra, references/divisors, determined spectra)."""
+        ids = {int(i) for i in ids}
+
+        def refs(obj):
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    if k in ("calibration_ids", "ids", "inputs") and isinstance(v, list):
+                        yield from (int(x) for x in v if isinstance(x, (int, float)))
+                    elif k in ("reference", "reference2", "divisor") and \
+                            isinstance(v, (int, float)) and not isinstance(v, bool):
+                        yield int(v)
+                    else:
+                        yield from refs(v)
+            elif isinstance(obj, list):
+                for v in obj:
+                    yield from refs(v)
+        methods = [m for m in self.methods() if ids & set(refs(m["definition"]))]
+        results = [r for r in self.results() if ids & set(refs(r["data"]))]
+        return {"methods": methods, "results": results}
+
+    def revise_processing(self, ids: list[int], steps: list[dict], reason: str,
+                          suffix: str | None = None) -> dict[int, int]:
+        """Change the processing of derived spectra.
+
+        Each spectrum in ``ids`` is recomputed from its own parent with the new
+        ``steps``; every spectrum built on top of it (further processing, or
+        using it as divisor/reference) is recomputed with its own recorded steps
+        on the new input. Data are never overwritten: new derived spectra are
+        stored and the old ones archived, all in one audited transaction.
+        Returns {old id: new id}."""
+        if not reason.strip():
+            raise ValueError("a reason for the change is required")
+        if not steps:
+            raise ValueError("no processing steps")
+        for st in steps:
+            if st["op"] not in REGISTRY:
+                raise KeyError(f"unknown operation {st['op']}")
+        recs = [self.record(i) for i in ids]
+        bad = [r.name for r in recs if r.kind != "derived" or r.archived]
+        if bad:
+            raise ValueError("only current derived spectra can be re-processed: " + ", ".join(bad))
+        resolve = self.resolver()
+
+        def name_of(ref):
+            return self.record(int(ref)).name
+
+        def spectrum_refs(pipeline):
+            return sorted({int(v) for st in pipeline for p in REGISTRY[st["op"]].params
+                           if p.kind == "spectrum"
+                           for v in [st.get("params", {}).get(p.name)] if v is not None})
+
+        def remap(pipeline, mapping):
+            out = []
+            for st in pipeline:
+                prm = dict(st.get("params", {}))
+                for p in REGISTRY[st["op"]].params:
+                    v = prm.get(p.name)
+                    if p.kind == "spectrum" and v is not None and int(v) in mapping:
+                        prm[p.name] = mapping[int(v)]
+                out.append({"op": st["op"], "params": prm})
+            return out
+
+        def build(rec, parent: int, pipeline: list[dict], name: str) -> int:
+            src = self.spectrum(parent)
+            res = apply_pipeline(src, pipeline, resolve)
+            res.name = name
+            res.metadata = {k: v for k, v in rec.metadata.items()}
+            res.metadata["processing"] = [describe_step(st, name_of) for st in pipeline]
+            res.metadata["revision_of"] = rec.id
+            new = self._insert_spectrum(res, rec.trial_id, "derived",
+                                        [parent] + spectrum_refs(pipeline), pipeline, rec.role)
+            self.conn.execute("UPDATE spectra SET archived=1 WHERE id=?", (rec.id,))
+            return new
+
+        label = suffix or " → ".join(REGISTRY[st["op"]].label.split(" (")[0] for st in steps)
+        mapping: dict[int, int] = {}
+        with self._tx():
+            for rec in recs:
+                parent = rec.parent_ids[0]
+                mapping[rec.id] = build(rec, parent, steps,
+                                        f"{self.record(parent).name} | {label}")
+            # rebuild everything downstream, in dependency order
+            while True:
+                stale = [r for r in self.records() if r.kind == "derived"
+                         and any(p in mapping for p in r.parent_ids)]
+                if not stale:
+                    break
+                waiting = {r.id for r in stale}
+                # a spectrum is rebuilt once none of its own inputs still wait
+                ready = [r for r in stale if not waiting & set(r.parent_ids)] or stale[:1]
+                for r in ready:
+                    parent = mapping.get(r.parent_ids[0], r.parent_ids[0])
+                    mapping[r.id] = build(r, parent, remap(r.pipeline, mapping), r.name)
+            self._audit("REVISE", "spectrum", None,
+                        f"Changed the processing of {len(recs)} spectra "
+                        f"({len(mapping) - len(recs)} downstream spectra rebuilt)",
+                        {"before": {str(r.id): r.pipeline for r in recs}, "after": steps,
+                         "replaced": {str(k): v for k, v in mapping.items()},
+                         "inputs": [r.parent_ids[0] for r in recs],
+                         "outputs": list(mapping.values())}, reason)
+        self._notify("spectrum", None)
+        return mapping
 
     def archive_spectra(self, ids: list[int], reason: str, archived: bool = True) -> None:
         with self._tx():
@@ -696,6 +833,60 @@ class Project:
                          "data": data})
         self._notify("result", rid)
         return int(rid)
+
+    def archive_result(self, rid: int, reason: str) -> None:
+        with self._tx():
+            self.conn.execute("UPDATE results SET archived=1 WHERE id=?", (rid,))
+            self._audit("ARCHIVE", "result", rid, f"Archived result #{rid}", {}, reason)
+        self._notify("result", rid)
+
+    def current_method_version(self, mid: int) -> dict | None:
+        """The current (non-archived) version of method ``mid`` — itself, or
+        the latest revision made from it; None if it was archived."""
+        for m in self.methods():
+            cur, seen = m, set()
+            while cur is not None and cur["id"] not in seen:
+                if cur["id"] == mid:
+                    return m
+                seen.add(cur["id"])
+                prev = cur["definition"].get("revision_of")
+                cur = self.method(int(prev), include_archived=True) if prev else None
+        return None
+
+    def result(self, rid: int) -> dict:
+        r = self.conn.execute("SELECT id, trial_id, method_id, name, kind, data, created_utc, "
+                              "archived FROM results WHERE id=?", (rid,)).fetchone()
+        if r is None:
+            raise KeyError(f"result #{rid} not found")
+        return {"id": r[0], "trial_id": r[1], "method_id": r[2], "name": r[3], "kind": r[4],
+                "data": json.loads(r[5]), "created_utc": r[6], "archived": bool(r[7])}
+
+    def revise_result(self, rid: int, name: str, data: dict, reason: str,
+                      method_id: int | None = None) -> int:
+        """Edit a saved result: stored as a new version (``revision_of``,
+        ``version``), the old version archived, one audited transaction."""
+        if not reason.strip():
+            raise ValueError("a reason for the change is required")
+        old = self.result(rid)
+        if old["archived"]:
+            raise KeyError(f"result #{rid} is archived (an older version)")
+        data = dict(data)
+        data["revision_of"] = rid
+        data["version"] = int(old["data"].get("version", 1)) + 1
+        mid = old["method_id"] if method_id is None else method_id
+        with self._tx():
+            new = self.conn.execute(
+                "INSERT INTO results (trial_id, method_id, name, kind, data, created_utc)"
+                " VALUES (?,?,?,?,?,?)",
+                (old["trial_id"], mid, name, old["kind"], _json(data), utc_now())).lastrowid
+            self.conn.execute("UPDATE results SET archived=1 WHERE id=?", (rid,))
+            self._audit("REVISE", "result", new,
+                        f"Revised result #{rid} '{old['name']}' → #{new} '{name}' "
+                        f"(version {data['version']})",
+                        {"before": {"id": rid, "name": old["name"], "data": old["data"]},
+                         "after": {"id": new, "name": name, "data": data}}, reason)
+        self._notify("result", new)
+        return int(new)
 
     def results(self, trial_id: int | None = None) -> list[dict]:
         q = "SELECT id, trial_id, method_id, name, kind, data, created_utc FROM results WHERE archived=0"

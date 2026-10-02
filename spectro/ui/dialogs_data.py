@@ -11,7 +11,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDialog,
                                QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
-                               QInputDialog, QLabel, QLineEdit, QPlainTextEdit,
+                               QInputDialog, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
                                QPushButton, QSplitter, QTableWidget, QTableWidgetItem,
                                QVBoxLayout, QWidget)
 
@@ -22,6 +22,27 @@ from spectro.core.operations import apply_pipeline
 from spectro.storage.project import ROLES
 from spectro.ui.widgets import (PasteTable, PipelineEditor, SpectrumPlot, ask_reason, error,
                                 fill_table)
+
+
+def impact_text(project, ids) -> str:
+    """Saved methods/results that use any of ``ids`` (empty if none)."""
+    use = project.usage(ids)
+    lines = []
+    if use["methods"]:
+        lines.append("Saved methods that use these spectra (open <i>Saved methods → "
+                     "Edit…</i> to refit them on the corrected data):<br>"
+                     + "<br>".join(f"&nbsp;• #{m['id']} {m['name']}" for m in use["methods"]))
+    if use["results"]:
+        lines.append("Saved results that use these spectra (open <i>Saved methods → "
+                     "Results → Edit…</i> and press <i>Recalculate</i>):<br>"
+                     + "<br>".join(f"&nbsp;• #{r['id']} {r['name']}" for r in use["results"]))
+    return "<br><br>".join(lines)
+
+
+def notify_impact(parent, project, ids, done: str) -> None:
+    text = impact_text(project, ids)
+    if text:
+        QMessageBox.information(parent, "Spectro", f"{done}<br><br>{text}")
 
 
 def spectrum_choices(project):
@@ -421,21 +442,42 @@ class ConcentrationsDialog(Base):
         reason = ask_reason(self, "Save concentration table?")
         if reason is None:
             return
+        changed = [r.id for r in self.recs if conc_all[r.id] != r.concentrations]
         self.project.set_concentrations_bulk(conc_all, reason)
         for sid, name, role in other:
             self.project.update_spectrum(sid, reason, name=name, role=role)
         self.accept()
+        if changed:
+            touched = changed + [d for sid in changed for d in self.project.descendants(sid)]
+            notify_impact(self.win, self.project, touched,
+                          f"Concentrations of {len(changed)} spectra saved (processed "
+                          "versions of these samples were updated too).")
 
 
 # --------------------------------------------------------------------------- #
 # Processing
 # --------------------------------------------------------------------------- #
 class ProcessDialog(Base):
-    def __init__(self, win, ids: list[int]):
-        super().__init__(win, f"Processing pipeline — {len(ids)} spectra")
+    """Build a processing pipeline — or, with ``edit=True``, change the
+    processing of existing derived spectra (they are recomputed from their
+    parents and everything built on them is rebuilt)."""
+
+    def __init__(self, win, ids: list[int], edit: bool = False):
+        super().__init__(win, (f"Edit processing — {len(ids)} derived spectra" if edit else
+                               f"Processing pipeline — {len(ids)} spectra"))
         self.resize(1200, 720)
         self.ids = ids
-        self.spectra = self.project.spectra(ids)
+        self.edit = edit
+        if edit:
+            recs = self.project.records(ids=ids, include_archived=True)
+            bad = [r.name for r in recs if r.kind != "derived" or r.archived]
+            if bad:
+                raise ValueError("Only current derived (processed) spectra can be edited; "
+                                 "raw data never changes: " + ", ".join(bad))
+            self.recs = recs
+            self.spectra = self.project.spectra([r.parent_ids[0] for r in recs])
+        else:
+            self.spectra = self.project.spectra(ids)
         lay = QHBoxLayout(self)
         left = QWidget()
         ll = QVBoxLayout(left)
@@ -473,6 +515,23 @@ class ProcessDialog(Base):
         split.addWidget(right)
         split.setSizes([460, 740])
         lay.addWidget(split)
+        if edit:
+            self.editor.set_steps(self.recs[0].pipeline)
+            self.suffix.setPlaceholderText("keep the step names (automatic)")
+            bb.button(QDialogButtonBox.Apply).setText("Apply changes…")
+            down = sorted({d for r in self.recs
+                           for d in self.project.descendants(r.id, include_references=True)})
+            note = ("Editing the steps that made the selected spectra from their parent. "
+                    "New versions are stored and the old ones archived (kept, with the "
+                    "change and its reason in the audit trail).")
+            if down:
+                note += (f" {len(down)} spectra built on them will be recomputed with "
+                         "their own steps.")
+            if len({json.dumps(r.pipeline, sort_keys=True) for r in self.recs}) > 1:
+                note += " ⚠ The selected spectra had different steps; all will get these."
+            lbl = QLabel(note)
+            lbl.setWordWrap(True)
+            ll.insertWidget(0, lbl)
         self._preview()
 
     def _preview(self):
@@ -504,6 +563,9 @@ class ProcessDialog(Base):
         if not steps:
             error(self, "Add at least one step.")
             return
+        if self.edit:
+            self._apply_edit(steps)
+            return
         try:
             out = self.project.process(self.ids, steps, self.suffix.text().strip() or None)
         except Exception as exc:
@@ -511,6 +573,25 @@ class ProcessDialog(Base):
             return
         self.win.statusBar().showMessage(f"Created {len(out)} derived spectra.")
         self.accept()
+
+    def _apply_edit(self, steps):
+        reason = ask_reason(self, "Change the processing of the selected spectra?", required=True)
+        if reason is None:
+            return
+        try:
+            mapping = self.project.revise_processing(self.ids, steps, reason,
+                                                     self.suffix.text().strip() or None)
+        except Exception as exc:
+            error(self, exc)
+            return
+        self.mapping = mapping
+        self.win.statusBar().showMessage(
+            f"Re-processed {len(self.ids)} spectra; {len(mapping) - len(self.ids)} downstream "
+            "spectra rebuilt.")
+        self.accept()
+        notify_impact(self.win, self.project, list(mapping),
+                      f"Processing changed: {len(mapping)} spectra replaced by new versions "
+                      "(the old ones are archived).")
 
 
 # --------------------------------------------------------------------------- #

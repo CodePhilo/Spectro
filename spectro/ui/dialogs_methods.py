@@ -8,7 +8,8 @@ from pathlib import Path
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+                               QDoubleSpinBox, QFileDialog,
                                QFormLayout,
                                QGroupBox,
                                QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
@@ -421,6 +422,8 @@ class UnivariateDialog(Base):
             error(self, "Determine, run standard addition or a robustness study first.")
             return
         name, kind, data, ids = self.last
+        if getattr(self, "cal_ids", None) and kind == "univariate":
+            data = {**data, "calibration_ids": list(self.cal_ids)}
         self.project.save_result(name, kind, data, self.win.current_trial(),
                                  getattr(self, "method_id", None), ids)
         self.win.statusBar().showMessage("Results saved.")
@@ -785,7 +788,8 @@ class EquationsDialog(Base):
             error(self, "Determine first.")
             return
         self.project.save_result("Equation method results", "equations",
-                                 {"model": self.model.to_dict(), **self.predictions},
+                                 {"model": self.model.to_dict(), **self.predictions,
+                                  "calibration_ids": list(getattr(self, "cal_ids", []))},
                                  self.win.current_trial(), getattr(self, "method_id", None),
                                  self.predictions["ids"])
 
@@ -1382,6 +1386,9 @@ class ProgressiveDialog(Base):
             error(self, "Calculate first.")
             return
         method, data = self.last
+        if self.fitted:
+            data = {**data, "model": self.fitted[0].to_dict(),
+                    "calibration_ids": list(self.fitted[1])}
         self.project.save_result(method, "progressive", data, self.win.current_trial(),
                                  getattr(self, "method_id", None), data.get("ids"))
         self.win.statusBar().showMessage("Results saved.")
@@ -1864,7 +1871,8 @@ class ChemometricsDialog(Base):
             error(self, "Fit + predict first.")
             return
         self.project.save_result(f"{self.model.model_type} results", "chemometrics",
-                                 {"model": self.model.to_dict(), **self.predictions},
+                                 {"model": self.model.to_dict(), **self.predictions,
+                                  "calibration_ids": list(getattr(self, "cal_ids", []))},
                                  self.win.current_trial(), getattr(self, "method_id", None),
                                  self.predictions["ids"])
 
@@ -1872,6 +1880,36 @@ class ChemometricsDialog(Base):
 # --------------------------------------------------------------------------- #
 # Saved methods & results
 # --------------------------------------------------------------------------- #
+def determine(project, d: dict, ids: list[int], refit: bool = False):
+    """Apply a method/model definition to spectra ``ids``.
+
+    Returns (compounds, found rows, method). The method is calibrated on its
+    ``calibration_ids`` when it carries no calibration — or always with
+    ``refit`` (e.g. after calibration concentrations were corrected)."""
+    res = project.resolver()
+    m = method_from_definition(d)
+    spectra = project.spectra(ids)
+    cal = d.get("calibration_ids") or []
+    if refit and not cal:
+        raise ValueError("this method does not record its calibration spectra, so it cannot "
+                         "be refitted — untick 'Refit'")
+    if d["type"] == "univariate":
+        if m.regression is None or refit:
+            m.calibrate(project.spectra(cal), res)
+        return [m.compound], [[m.predict(s, res)] for s in spectra], m
+    if d["type"] == "equations":
+        if m.K is None or refit:
+            m.fit(project.spectra(cal), res)
+        return m.compounds, m.predict(spectra, res).tolist(), m
+    if d["type"] in uv.PROGRESSIVE_TYPES:
+        if not m.is_fitted or refit:
+            m.fit_spectra(project.spectra(cal), res)
+        return m.compounds, m.predict_spectra(spectra, res).tolist(), m
+    if not m.is_fitted or refit:
+        m.fit(project.spectra(cal), res)
+    return m.compounds, m.predict(spectra, res).tolist(), m
+
+
 def method_from_definition(d: dict):
     t = d.get("type")
     if t in uv.PROGRESSIVE_TYPES:
@@ -1926,7 +1964,16 @@ class SavedDialog(Base):
         rl.addWidget(self.rtable)
         xl = QPushButton("Export all results to Excel…")
         xl.clicked.connect(self.win.export_results)
+        redit = QPushButton("Edit…")
+        redit.setToolTip("Rename, add notes, exclude spectra from the statistics, or "
+                         "recalculate with the current method and data. Stored as a new "
+                         "version (the old one is archived, the reason is recorded).")
+        redit.clicked.connect(self._edit_result)
+        rarch = QPushButton("Archive result…")
+        rarch.clicked.connect(self._archive_result)
         rrow = QHBoxLayout()
+        rrow.addWidget(redit)
+        rrow.addWidget(rarch)
         rrow.addWidget(xl)
         rrow.addStretch(1)
         rl.addLayout(rrow)
@@ -1948,8 +1995,11 @@ class SavedDialog(Base):
                         if m["definition"].get("revision_of") else ""),
                      m["created_utc"][:19]] for m in self.methods])
         self.res = self.project.results()
-        fill_table(self.rtable, ["#", "Name", "Kind", "Method", "Created (UTC)"],
+        fill_table(self.rtable, ["#", "Name", "Kind", "Method", "Version", "Created (UTC)"],
                    [[str(r["id"]), r["name"], r["kind"], str(r["method_id"] or ""),
+                     str(r["data"].get("version", 1))
+                     + (f" (replaces #{r['data']['revision_of']})"
+                        if r["data"].get("revision_of") else ""),
                      r["created_utc"][:19]] for r in self.res])
 
     def _show_method(self):
@@ -1977,6 +2027,32 @@ class SavedDialog(Base):
         self.out.export_notes = summary
         self.detail.setPlainText("\n".join([f"{res['name']}  ({res['kind']}, result #{res['id']})"]
                                            + summary))
+
+    def _selected_result(self) -> dict | None:
+        r = self.rtable.currentRow()
+        if not 0 <= r < len(self.res):
+            error(self, "Select a result.")
+            return None
+        return self.res[r]
+
+    def _edit_result(self):
+        res = self._selected_result()
+        if res is None:
+            return
+        dlg = ResultEditDialog(self.win, res["id"])
+        self.editor = dlg
+        dlg.exec()
+        self._load()
+
+    def _archive_result(self):
+        from spectro.ui.widgets import ask_reason
+        res = self._selected_result()
+        if res is None:
+            return
+        reason = ask_reason(self, f"Archive result #{res['id']} '{res['name']}'?", required=True)
+        if reason:
+            self.project.archive_result(res["id"], reason)
+            self._load()
 
     EDITORS = {"univariate": "UnivariateDialog", "equations": "EquationsDialog",
                "spectral": "ChemometricsDialog", "amplitude_centering": "ProgressiveDialog",
@@ -2074,30 +2150,9 @@ class SavedDialog(Base):
             return
         md = self.methods[r]
         d = md["definition"]
-        res = self.project.resolver()
         try:
-            m = method_from_definition(d)
             spectra = self.project.spectra(ids)
-            if d["type"] == "univariate":
-                if m.regression is None:
-                    m.calibrate(self.project.spectra(d["calibration_ids"]), res)
-                found = [[m.predict(s, res)] for s in spectra]
-                comps = [m.compound]
-            elif d["type"] == "equations":
-                if m.K is None:
-                    m.fit(self.project.spectra(d["calibration_ids"]), res)
-                found = m.predict(spectra, res).tolist()
-                comps = m.compounds
-            elif d["type"] in uv.PROGRESSIVE_TYPES:
-                if not m.is_fitted:
-                    m.fit_spectra(self.project.spectra(d["calibration_ids"]), res)
-                found = m.predict_spectra(spectra, res).tolist()
-                comps = m.compounds
-            else:
-                if not m.is_fitted:
-                    m.fit(self.project.spectra(d["calibration_ids"]), res)
-                found = m.predict(spectra, res).tolist()
-                comps = m.compounds
+            comps, found, _ = determine(self.project, d, ids)
         except Exception as exc:
             error(self, exc)
             return
@@ -2114,3 +2169,197 @@ class SavedDialog(Base):
                                  {"ids": ids, "compounds": comps, "found": found},
                                  self.win.current_trial(), md["id"], ids)
         self._load()
+
+
+class ResultEditDialog(Base):
+    """Edit a saved result. Nothing is overwritten: saving stores a new version
+    of the result (the old one is archived and the reason is audited).
+
+    Found values can only change by recalculation — with the result's own
+    model, or any saved method — never by typing them in."""
+
+    OWN = -1
+
+    def __init__(self, win, rid: int):
+        super().__init__(win, f"Edit result #{rid}")
+        self.resize(1000, 680)
+        self.res = self.project.result(rid)
+        self.data = json.loads(json.dumps(self.res["data"]))
+        self.method_id = self.res["method_id"]
+        lay = QVBoxLayout(self)
+        f = QFormLayout()
+        self.name = QLineEdit(self.res["name"])
+        f.addRow("Name", self.name)
+        self.notes = QPlainTextEdit(self.data.get("notes", ""))
+        self.notes.setPlaceholderText("Comments shown with the result and in the Excel export")
+        self.notes.setMaximumHeight(70)
+        f.addRow("Notes", self.notes)
+        lay.addLayout(f)
+        self.has_rows = bool(self.data.get("ids")) and isinstance(self.data.get("found"), list)
+        g = QGroupBox("Spectra — untick to exclude from the statistics (kept in the table, "
+                      "marked 'excluded')")
+        gl = QVBoxLayout(g)
+        self.table = QTableWidget()
+        gl.addWidget(self.table)
+        self.excl_note = QLineEdit(self.data.get("exclusion_note", ""))
+        self.excl_note.setPlaceholderText("Why are spectra excluded? (e.g. Grubbs outlier, "
+                                          "bubble in cuvette)")
+        gl.addWidget(self.excl_note)
+        self.summary = QLabel()
+        self.summary.setWordWrap(True)
+        gl.addWidget(self.summary)
+        lay.addWidget(g, 1)
+        rg = QGroupBox("Recalculate found values with the current data")
+        rl = QFormLayout(rg)
+        self.source = QComboBox()
+        own = self._own_definition()
+        if own is not None:
+            self.source.addItem("This result's own model", self.OWN)
+        current = (self.project.current_method_version(self.method_id)
+                   if self.method_id else None)
+        for m in self.project.methods():
+            if m["type"] in ("univariate", "equations", "spectral") or \
+                    m["type"] in uv.PROGRESSIVE_TYPES:
+                tag = "  (the method of this result, current version)" \
+                    if current and m["id"] == current["id"] else ""
+                self.source.addItem(f"Saved method #{m['id']} {m['name']}{tag}", m["id"])
+        if current is not None:
+            self.source.setCurrentIndex(self.source.findData(current["id"]))
+        self.refit = QCheckBox("Refit the calibration on the current calibration spectra "
+                               "(use after correcting their concentrations or processing)")
+        self.refit.setChecked(bool((own or {}).get("calibration_ids")
+                                   or self.data.get("calibration_ids")))
+        recalc = QPushButton("Recalculate")
+        recalc.clicked.connect(self._recalculate)
+        rl.addRow("Method", self.source)
+        rl.addRow(self.refit)
+        rl.addRow(recalc)
+        self.recalc_msg = QLabel()
+        self.recalc_msg.setWordWrap(True)
+        rl.addRow(self.recalc_msg)
+        if not self.has_rows or self.source.count() == 0:
+            rg.setEnabled(False)
+            self.recalc_msg.setText("This result has no per-spectrum concentrations to "
+                                    "recalculate." if not self.has_rows else
+                                    "No saved method or stored model to recalculate with.")
+        lay.addWidget(rg)
+        bb = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self._save)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+        self._fill()
+        self.table.itemChanged.connect(self._fill)
+
+    def _own_definition(self) -> dict | None:
+        for key in ("model", "method"):
+            d = self.data.get(key)
+            if isinstance(d, dict) and (d.get("type") in ("univariate", "equations", "spectral")
+                                        or d.get("type") in uv.PROGRESSIVE_TYPES):
+                d = dict(d)
+                if self.data.get("calibration_ids") and not d.get("calibration_ids"):
+                    d["calibration_ids"] = self.data["calibration_ids"]
+                return d
+        return None
+
+    def _excluded(self) -> list[int]:
+        out = []
+        for i in range(self.table.rowCount()):
+            it = self.table.item(i, 0)
+            if it is not None and it.checkState() != Qt.Checked:
+                out.append(int(it.data(Qt.UserRole)))
+        return out
+
+    def _fill(self):
+        from spectro.storage.tables import result_table
+
+        if self.table.rowCount():
+            self.data["excluded_ids"] = self._excluded()
+        headers, rows, summary = result_table(self.project, self.data)
+        self.table.blockSignals(True)
+        fill_table(self.table, headers, rows)
+        self.table.blockSignals(False)
+        if self.has_rows and headers and headers[0] == "Spectrum":
+            excluded = {int(i) for i in self.data.get("excluded_ids") or []}
+            valid = []
+            for sid in self.data["ids"]:
+                try:
+                    self.project.record(int(sid))
+                    valid.append(int(sid))
+                except (KeyError, TypeError, ValueError):
+                    pass
+            self.table.blockSignals(True)
+            for i, sid in enumerate(valid[:self.table.rowCount()]):
+                it = self.table.item(i, 0)
+                it.setText(it.text().replace(" (excluded)", ""))
+                it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+                it.setData(Qt.UserRole, sid)
+                it.setCheckState(Qt.Unchecked if sid in excluded else Qt.Checked)
+            self.table.blockSignals(False)
+        self.summary.setText("\n".join(summary))
+
+    def _definition(self) -> tuple[dict, int | None]:
+        key = self.source.currentData()
+        if key == self.OWN:
+            return self._own_definition(), self.method_id
+        md = self.project.method(int(key))
+        return md["definition"], md["id"]
+
+    def _recalculate(self):
+        try:
+            d, mid = self._definition()
+            ids = [int(i) for i in self.data["ids"]]
+            comps, found, m = determine(self.project, d, ids, refit=self.refit.isChecked())
+        except Exception as exc:
+            error(self, exc)
+            return
+        excluded = self._excluded()
+        for k in ("X", "Y", "taken", "recovery", "signals", "names", "found_minus_added"):
+            self.data.pop(k, None)
+        self.data.update({"ids": ids, "compounds": comps, "found": found,
+                          "excluded_ids": excluded})
+        if self.data.get("enrichment_added") and len(comps) == 1:
+            self.data["found_minus_added"] = [f[0] - self.data["enrichment_added"] for f in found]
+        key = "method" if isinstance(self.data.get("method"), dict) else "model"
+        self.data[key] = m.to_dict()
+        if self.refit.isChecked() and d.get("calibration_ids"):
+            self.data["calibration_ids"] = list(d["calibration_ids"])
+        self.data["recalculated"] = {"source": self.source.currentText(), "method_id": mid,
+                                     "refit": self.refit.isChecked()}
+        self.method_id = mid
+        self._fill()
+        self.recalc_msg.setText(f"Recalculated {len(ids)} spectra with "
+                                f"{self.source.currentText()}. Save to keep it.")
+
+    def _save(self):
+        from spectro.ui.widgets import ask_reason
+
+        name = self.name.text().strip() or self.res["name"]
+        data = self.data
+        if self.table.rowCount() and self.has_rows:
+            data["excluded_ids"] = self._excluded()
+        if not data.get("excluded_ids"):
+            data.pop("excluded_ids", None)
+        note = self.excl_note.text().strip()
+        if note:
+            data["exclusion_note"] = note
+        else:
+            data.pop("exclusion_note", None)
+        if self.notes.toPlainText().strip():
+            data["notes"] = self.notes.toPlainText().strip()
+        else:
+            data.pop("notes", None)
+        clean = {k: v for k, v in self.res["data"].items() if k not in ("revision_of", "version")}
+        if name == self.res["name"] and data == clean:
+            self.reject()
+            return
+        reason = ask_reason(self, f"Save a new version of result #{self.res['id']}?",
+                            required=True)
+        if reason is None:
+            return
+        try:
+            self.new_id = self.project.revise_result(self.res["id"], name, data, reason,
+                                                     self.method_id)
+        except Exception as exc:
+            error(self, exc)
+            return
+        self.accept()

@@ -205,3 +205,64 @@ def test_progressive_methods_with_smoothing_steps(tmp_path):
     assert err[True] < 0.5 * err[False] and err[True] < 0.05   # 10.3 % → 3.4 % here
     af = uv.AbsorptionFactorMethod([("X", 340.0)], steps=sg)
     assert uv.progressive_from_dict(af.to_dict()).steps == sg
+
+
+def test_changing_processing_rebuilds_downstream_and_keeps_history(project, tmp_path):
+    tid, ids = _import_two(project, tmp_path)
+    a, b = ids
+    sm = project.process([b], [{"op": "smooth_sg", "params": {"window": 5, "order": 2}}])[0]
+    ratio = project.process([a], [{"op": "divide", "params": {"reference": sm}}])[0]
+    d1 = project.process([ratio], [{"op": "derivative", "params": {"order": 1}}])[0]
+    with pytest.raises(ValueError):
+        project.revise_processing([sm], [{"op": "smooth_sg", "params": {"window": 9}}], " ")
+    with pytest.raises(ValueError):
+        project.revise_processing([a], [{"op": "derivative", "params": {}}], "raw")
+    mapping = project.revise_processing(
+        [sm], [{"op": "smooth_sg", "params": {"window": 9, "order": 2}}], "wider window")
+    assert set(mapping) == {sm, ratio, d1}
+    live = {r.id for r in project.records(tid)}
+    assert not {sm, ratio, d1} & live and set(mapping.values()) <= live
+    new_ratio = project.record(mapping[ratio])
+    assert new_ratio.parent_ids == [a, mapping[sm]]
+    assert new_ratio.pipeline[0]["params"]["reference"] == mapping[sm]
+    assert project.record(mapping[d1]).parent_ids == [mapping[ratio]]
+    assert project.record(mapping[sm]).pipeline[0]["params"]["window"] == 9
+    for new in mapping.values():
+        assert project.replay(new)["ok"]
+    e = project.audit_entries(action="REVISE")[0]
+    assert e.reason == "wider window" and e.details["replaced"][str(sm)] == mapping[sm]
+    assert project.verify()["ok"]
+
+
+def test_concentration_edits_reach_processed_versions(project, tmp_path):
+    tid, ids = _import_two(project, tmp_path)
+    d = project.process([ids[0]], [{"op": "derivative", "params": {"order": 1}}])[0]
+    dd = project.process([d], [{"op": "derivative", "params": {"order": 1}}])[0]
+    project.update_spectrum(ids[0], reason="weighing", concentrations={"X": 12.5})
+    assert project.record(d).concentrations == {"X": 12.5}
+    assert project.record(dd).concentrations == {"X": 12.5}
+    e = project.audit_entries(action="EDIT")[0]
+    assert set(e.details["propagated_to"]) == {d, dd}
+    project.set_concentrations_bulk({ids[0]: {"X": 11.0}}, reason="re-weighed")
+    assert project.record(dd).concentrations == {"X": 11.0}
+    mid = project.save_method("m", {"type": "univariate", "calibration_ids": [d]})
+    project.save_result("r", "univariate", {"ids": [ids[1]]})
+    use = project.usage([d])
+    assert [m["id"] for m in use["methods"]] == [mid] and use["results"] == []
+    assert len(project.usage([ids[1]])["results"]) == 1
+
+
+def test_revising_a_result_creates_an_audited_new_version(project):
+    rid = project.save_result("Assay", "univariate", {"rows": [1, 2]})
+    with pytest.raises(ValueError):
+        project.revise_result(rid, "Assay", {"rows": [1]}, "")
+    r2 = project.revise_result(rid, "Assay (corrected)", {"rows": [1], "excluded_ids": [2]},
+                               "outlier")
+    assert [r["id"] for r in project.results()] == [r2]
+    new = project.result(r2)
+    assert new["data"]["revision_of"] == rid and new["data"]["version"] == 2
+    assert project.result(rid)["archived"] and project.result(rid)["data"] == {"rows": [1, 2]}
+    with pytest.raises(KeyError):
+        project.revise_result(rid, "x", {}, "old version")
+    assert project.audit_entries(action="REVISE")[0].reason == "outlier"
+    assert project.verify()["ok"]

@@ -34,17 +34,19 @@ def result_table(project, data: dict) -> tuple[list[str], list[list[Any]], list[
     if ids and comps and isinstance(found, list) and found and isinstance(found[0], list):
         headers = ["Spectrum"] + [h for c in comps for h in
                                   (f"{c} found", f"{c} taken", f"{c} recovery %")]
+        excluded = {int(i) for i in data.get("excluded_ids") or []}
         rows, recs = [], {c: [] for c in comps}
         for sid, f in zip(ids, found):
             try:
                 rec = project.record(int(sid))
             except (KeyError, TypeError, ValueError):
                 continue
-            row: list[Any] = [rec.name]
+            out = int(sid) in excluded
+            row: list[Any] = [rec.name + (" (excluded)" if out else "")]
             for c, v in zip(comps, f):
                 t = rec.concentrations.get(c)
                 r = 100 * v / t if (t and v is not None) else None
-                if r is not None:
+                if r is not None and not out:
                     recs[c].append(r)
                 row += [_num(v), t, r]
             rows.append(row)
@@ -54,6 +56,13 @@ def result_table(project, data: dict) -> tuple[list[str], list[list[Any]], list[
                 d = describe(v)
                 summary.append(f"{c}: mean recovery {d['mean']:.2f} %, SD {d['sd']:.3f}, "
                                f"RSD {d['rsd']:.2f} % (n = {d['n']})")
+        if excluded:
+            n_ex = len(excluded & {int(i) for i in ids})
+            summary.append(f"{n_ex} {'spectrum' if n_ex == 1 else 'spectra'} excluded from "
+                           "the statistics" + (f": {data['exclusion_note']}"
+                                               if data.get("exclusion_note") else ""))
+        if data.get("notes"):
+            summary.append(f"Notes: {data['notes']}")
         return headers, rows, summary
     rows = [[k, v] for k, v in _flatten(data)]
     return ["Item", "Value"], rows, []

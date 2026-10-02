@@ -45,6 +45,7 @@ The suite is organised by *what kind of error it can catch*.
 | 21 | Savitzky–Golay | polynomial orders up to the window length were accepted; order 18 gave an ill-conditioned fit (NumPy RankWarning) | orders above 10 refused (2–4 is usual) |
 | 22 | Amplitude centering | the *unified regression* pooled the divisor compound with the two compounds sharing the isoabsorptive point → RIDSS recoveries ≈ 124 % (found while generating the method guide; the old test did not exercise it) | the divisor compound keeps its own line; test now checks recoveries |
 | 23 | Optimizer | amplitude-centering candidates were generated only in the largest region where the divisor is usable; a divisor with two bands lost the region where the other compounds absorb, and plateau configurations vanished | every usable region is searched, λc must give each compound a usable ratio amplitude, two partner λ are screened per λc; ternary test errors fell from 3.5 / 6.6 / 3.0 % to 1.6 / 2.6 / 0.4 % |
+| 24 | Concentration edits | correcting a sample's concentrations did not reach its processed (derivative, ratio…) versions, so methods calibrated on processed spectra and their recoveries still used the old values | the correction is copied to every processed version in the same audited transaction, and the saved methods/results that use the spectra are listed so they can be refitted / recalculated |
 
 ## Known limitations (documented, not bugs)
 

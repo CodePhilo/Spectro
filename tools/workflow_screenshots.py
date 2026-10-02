@@ -504,6 +504,34 @@ class Demo:
                     "Excel (one sheet each) and methods to portable .spmodel files.",
                     "Methods → Saved methods & results")
 
+    # 17b
+    def editing(self):
+        from spectro.ui.dialogs_data import ProcessDialog
+        from spectro.ui.dialogs_methods import ResultEditDialog
+        der = self.ids(lambda r: r.kind == "derived" and r.pipeline
+                       and r.pipeline[0]["op"] == "derivative")
+        if not der:
+            der = self.ids(lambda r: r.kind == "derived")
+        d = ProcessDialog(self.win, der[:6], edit=True)
+        self.s.shot(d, "edit_processing", "Edit a processing chain after the fact",
+                    "change any step (Δλ, smoothing window, divisor…) of processed spectra; "
+                    "they are recomputed from their parents, everything built on them is "
+                    "rebuilt, and the old versions stay archived with the reason in the audit "
+                    "trail.",
+                    "Select processed spectra → Process → Edit processing of selected spectra… "
+                    "(or Lineage tab → Edit processing…)")
+        res = next(r for r in self.p.results() if isinstance(r["data"].get("found"), list)
+                   and r["data"].get("ids"))
+        e = ResultEditDialog(self.win, res["id"])
+        e.table.item(0, 0).setCheckState(Qt.Unchecked)
+        e.excl_note.setText("bubble in the cuvette — re-measured")
+        e.notes.setPlainText("Second analyst checked the dilutions.")
+        self.s.shot(e, "edit_result", "Edit a saved result",
+                    "rename, add notes, exclude a spectrum from the statistics (kept and "
+                    "marked), or recalculate with the current method and corrected "
+                    "concentrations — saved as a new version, never overwritten.",
+                    "Methods → Saved methods & results → Results → Edit…")
+
     # 18
     def report(self):
         from spectro.ui.report import build_html
@@ -518,7 +546,7 @@ class Demo:
 
 WORKFLOWS = ["import_any_instrument", "organize", "audit", "pipeline", "views", "optimizer",
              "univariate", "equations", "special", "progressive", "chemometrics", "validation",
-             "design", "greenness", "figure", "results", "report"]
+             "design", "greenness", "figure", "results", "editing", "report"]
 
 
 def main(argv=None) -> int:

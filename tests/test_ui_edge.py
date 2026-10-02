@@ -389,3 +389,97 @@ def test_saved_methods_can_be_edited_and_renamed(app, tmp_path, messages, monkey
         assert not messages, messages
     finally:
         win.close_project()
+
+
+def test_results_concentrations_and_processing_can_be_edited(app, tmp_path, messages,
+                                                             monkeypatch):
+    """Result edit (exclude, notes, recalculate after a concentration fix),
+    concentration propagation notice and editing a processing chain."""
+    import spectro.ui.dialogs_data as dd
+    import spectro.ui.main_window as mw
+    from spectro.ui.dialogs_methods import ResultEditDialog, SavedDialog, UnivariateDialog
+    shown = []
+    monkeypatch.setattr(dd.QMessageBox, "information", lambda *a, **k: shown.append(a[2]))
+    win = mw.MainWindow()
+    p = Project.create(tmp_path / "e.spectro")
+    for c in ("X", "Y"):
+        p.add_compound(c)
+    tid = p.add_trial("T")
+    std = [p.add_spectrum(mixture({"Y": v}, f"std {v}"), tid, role="standard")
+           for v in (2, 4, 6, 8, 10)]
+    mix = [p.add_spectrum(mixture({"X": 3, "Y": v}, f"mix {v}"), tid, role="mixture")
+           for v in (3, 5, 7)]
+    win._attach(p)
+    try:
+        d = UnivariateDialog(win)
+        d.compound.setCurrentText("Y")
+        d.template.setCurrentText("Direct (zero order, λmax)")
+        d.meas.form.set_value("w1", 350.0)
+        d.cal.set_all(False)
+        for i in range(d.cal.count()):
+            if "std" in d.cal.item(i).text():
+                d.cal.item(i).setCheckState(Qt.Checked)
+        d._calibrate()
+        d.test.set_all(False)
+        for i in range(d.test.count()):
+            if "mix" in d.test.item(i).text():
+                d.test.item(i).setCheckState(Qt.Checked)
+        d._predict()
+        d._save_method()
+        d._save_results()
+        rid = p.results()[-1]["id"]
+        assert sorted(p.results()[-1]["data"]["calibration_ids"]) == sorted(std)
+
+        # a calibration standard was mis-weighed: correct it → notice lists the usage
+        c = dd.ConcentrationsDialog(win, [std[-1]])
+        c.table.item(0, 4).setText("12")
+        c._save()
+        assert p.record(std[-1]).concentrations["Y"] == 12
+        assert shown and "Saved methods" in shown[-1] and "Saved results" in shown[-1]
+
+        # edit the result: exclude one mixture, add notes, recalculate with refit
+        e = ResultEditDialog(win, rid)
+        assert e.refit.isChecked() and e.source.count() >= 2
+        before = [f[0] for f in e.data["found"]]
+        e.table.item(0, 0).setCheckState(Qt.Unchecked)
+        e.notes.setPlainText("re-checked")
+        e.source.setCurrentIndex(e.source.findData(e.OWN))
+        e._recalculate()
+        after = [f[0] for f in e.data["found"]]
+        assert abs(after[-1] - before[-1]) > 0.3  # refitted on the corrected standard
+        e._save()
+        new = p.results()[-1]
+        assert new["id"] == e.new_id and new["data"]["version"] == 2
+        assert new["data"]["excluded_ids"] == [mix[0]] and new["data"]["notes"] == "re-checked"
+        from spectro.storage.tables import result_table
+        _, rows, summary = result_table(p, new["data"])
+        assert rows[0][0].endswith("(excluded)") and "n = 2" in summary[0]
+
+        sd = SavedDialog(win)
+        sd.rtable.selectRow(len(sd.res) - 1)
+        monkeypatch.setattr(ResultEditDialog, "exec", lambda self: 0)
+        sd._edit_result()
+        assert sd.editor.res["id"] == new["id"]
+        sd.rtable.selectRow(len(sd.res) - 1)
+        sd._archive_result()
+        assert new["id"] not in [r["id"] for r in p.results()]
+
+        # processing chain: smooth → D1, then change the smoothing window
+        sm = p.process(mix, [{"op": "smooth_sg", "params": {"window": 5, "order": 2}}])
+        d1 = p.process(sm, [{"op": "derivative", "params": {"order": 1}}])
+        with pytest.raises(ValueError):
+            dd.ProcessDialog(win, [mix[0]], edit=True)
+        pd = dd.ProcessDialog(win, sm, edit=True)
+        assert pd.editor.get_steps()[0]["params"]["window"] == 5
+        steps = pd.editor.get_steps()
+        steps[0]["params"]["window"] = 11
+        pd.editor.set_steps(steps)
+        pd._apply()
+        assert set(pd.mapping) == set(sm) | set(d1)
+        live = {r.id for r in p.records()}
+        assert not (set(sm) | set(d1)) & live
+        for old in d1:
+            assert p.replay(pd.mapping[old])["ok"]
+        assert not messages, messages
+    finally:
+        win.close_project()
