@@ -35,6 +35,30 @@ class Regression:
     def predict_y(self, x: float | np.ndarray) -> float | np.ndarray:
         return self.slope * np.asarray(x) + self.intercept
 
+    def ci_x(self, y0: float, m: int = 1, alpha: float = 0.05) -> float:
+        """Half-width of the (1 − alpha) confidence interval of a concentration
+        read from the line, for the mean of ``m`` responses ``y0``:
+        s_x0 = (Sy/x / b)·√(1/m + 1/n + (y0 − ȳ)² / (b²·Σ(x − x̄)²)), times t(n − 2)
+        (Miller & Miller; through the origin: 1/n and the means drop out, n − 1 df)."""
+        x = np.asarray(self.x, dtype=float)
+        if x.size < 3 or not self.slope or not np.isfinite(self.sy_x):
+            return float("nan")
+        b = self.slope
+        if self.through_origin:
+            s = (self.sy_x / abs(b)) * np.sqrt(1 / m + y0 ** 2 / (b * b * np.sum(x * x)))
+            dof = x.size - 1
+        else:
+            ybar = float(np.mean(self.y))
+            sxx = float(np.sum((x - x.mean()) ** 2))
+            s = (self.sy_x / abs(b)) * np.sqrt(1 / m + 1 / x.size
+                                               + (y0 - ybar) ** 2 / (b * b * sxx))
+            dof = x.size - 2
+        return float(stats.t.ppf(1 - alpha / 2, dof) * s)
+
+    def ci_at_x(self, x0: float, m: int = 1, alpha: float = 0.05) -> float:
+        """As :meth:`ci_x`, for the concentration ``x0`` found."""
+        return self.ci_x(float(self.predict_y(x0)), m, alpha)
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -298,6 +322,54 @@ def standard_addition(added, response) -> dict:
     return {"regression": reg.to_dict(), "found": reg.intercept / reg.slope}
 
 
+# Critical values of Dixon's Q (two-sided, Rorabacher 1991), n = 3…10
+_DIXON = {0.10: [0.941, 0.765, 0.642, 0.560, 0.507, 0.468, 0.437, 0.412],
+          0.05: [0.970, 0.829, 0.710, 0.625, 0.568, 0.526, 0.493, 0.466],
+          0.01: [0.994, 0.926, 0.821, 0.740, 0.680, 0.634, 0.598, 0.568]}
+
+
+def grubbs(values, alpha: float = 0.05) -> dict:
+    """Two-sided Grubbs test for one outlier (ISO 5725-2).
+
+    G = max|x − x̄| / s, compared with
+    G_crit = (n − 1)/√n · √(t² / (n − 2 + t²)), t = t(alpha / (2n), n − 2)."""
+    v = _need(values, 3, "Grubbs test")
+    n = v.size
+    sd = float(np.std(v, ddof=1))
+    if sd == 0:
+        return {"test": "Grubbs", "n": n, "G": 0.0, "G_crit": float("nan"), "index": None,
+                "value": None, "outlier": False}
+    i = int(np.argmax(np.abs(v - v.mean())))
+    g = float(abs(v[i] - v.mean()) / sd)
+    t = stats.t.ppf(1 - alpha / (2 * n), n - 2)
+    gc = float((n - 1) / np.sqrt(n) * np.sqrt(t * t / (n - 2 + t * t)))
+    return {"test": "Grubbs", "n": n, "G": g, "G_crit": gc, "index": i, "value": float(v[i]),
+            "outlier": g > gc, "alpha": alpha}
+
+
+def dixon(values, alpha: float = 0.05) -> dict:
+    """Dixon's Q test (r10 = gap / range) for 3 ≤ n ≤ 10."""
+    v = _need(values, 3, "Dixon test")
+    n = v.size
+    if n > 10:
+        raise ValueError("Dixon's Q test is tabulated for 3–10 values; use Grubbs")
+    if alpha not in _DIXON:
+        raise ValueError("alpha must be 0.10, 0.05 or 0.01")
+    order = np.argsort(v)
+    s = v[order]
+    rng = float(s[-1] - s[0])
+    qc = _DIXON[alpha][n - 3]
+    if rng == 0:
+        return {"test": "Dixon", "n": n, "Q": 0.0, "Q_crit": qc, "index": None, "value": None,
+                "outlier": False, "alpha": alpha}
+    q_low, q_high = (s[1] - s[0]) / rng, (s[-1] - s[-2]) / rng
+    low = q_low >= q_high
+    q = float(q_low if low else q_high)
+    i = int(order[0] if low else order[-1])
+    return {"test": "Dixon", "n": n, "Q": q, "Q_crit": qc, "index": i, "value": float(v[i]),
+            "outlier": q > qc, "alpha": alpha}
+
+
 def prediction_error(predicted, actual) -> dict:
     p, a = _need(predicted, 1, "predicted values"), _need(actual, 1, "actual values")
     if p.size != a.size:
@@ -308,3 +380,110 @@ def prediction_error(predicted, actual) -> dict:
             "SEP": float(err.std(ddof=1)) if err.size > 1 else float("nan"),
             "R2": float(1 - np.sum(err ** 2) / np.sum((a - a.mean()) ** 2))
             if np.ptp(a) > 0 else float("nan")}
+
+
+# --------------------------------------------------------------------------- #
+# Validation plan (ICH Q2(R2)) for a chosen method
+# --------------------------------------------------------------------------- #
+def _sig(v: float, digits: int = 2) -> float:
+    """Round to ``digits`` significant figures (pipette-friendly levels)."""
+    if v == 0 or not np.isfinite(v):
+        return float(v)
+    return float(f"{v:.{digits}g}")
+
+
+def _levels(low: float, high: float, n: int) -> list[float]:
+    """About ``n`` levels from low to high: the ends plus round multiples of
+    a 1-2-2.5-5 step in between (easy to prepare from a stock solution)."""
+    raw = (high - low) / (n - 1)
+    mag = 10 ** np.floor(np.log10(raw))
+    step = min(k * mag for k in (1, 2, 2.5, 5, 10) if k * mag >= raw * 0.999)
+    inner = [k * step for k in range(int(np.ceil(low / step)), int(high / step) + 1)]
+    inner = [v for v in inner if v - low >= 0.5 * step and high - v >= 0.5 * step]
+    return [_sig(v, 3) for v in [low] + inner + [high]]
+
+
+def validation_plan(compound: str, low: float, high: float, unit: str = "µg/mL",
+                    label: str = "", steps: list[dict] | None = None,
+                    measurement: dict | None = None, wl_uncertainty: float = 1.0,
+                    expected_error: float = float("nan"), lod: float = float("nan"),
+                    multivariate: bool = False) -> list[list[str]]:
+    """A ready-to-run validation protocol: [parameter, design, acceptance].
+
+    Levels are spread over the calibration range of the standards; the
+    robustness factors are the method's own settings (wavelengths, Δλ,
+    smoothing window, plateau…)."""
+    if not (np.isfinite(low) and np.isfinite(high)) or high <= low:
+        raise ValueError(f"no concentration range for {compound}: give standards with at "
+                         "least two different concentrations")
+    lin = _levels(low, high, 6 if high / max(low, 1e-12) > 4 else 5)
+    target = min(lin, key=lambda v: abs(v - (low + high) / 2))
+    acc = [_sig(target * f) for f in (0.8, 1.0, 1.2)]
+    if acc[0] < low or acc[-1] > high:
+        acc = [_sig(low + (high - low) * f) for f in (0.2, 0.5, 0.8)]
+    f = ", ".join
+
+    def lv(vals):
+        return f(f"{v:g}" for v in vals) + f" {unit}"
+    rows = [
+        ["Method", label or compound, ""],
+        ["Specificity",
+         "laboratory-prepared mixtures covering the expected ratios of the compounds (at "
+         "least 5), the placebo / excipients and the solvent blank; compare the processed "
+         "spectra of mixture and pure standard",
+         "recovery of each mixture 98–102 %; blank and placebo give no signal at the "
+         "measured wavelength(s)"],
+        ["Linearity", f"{len(lin)} levels: {lv(lin)}, each in triplicate (independent "
+                      "dilutions)" + (" — calibration set of mixtures (e.g. Brereton 5-level "
+                                      "design, Tools → Calibration design)"
+                                      if multivariate else ""),
+         "r ≥ 0.999; residuals random (no trend); 95 % CI of the intercept includes 0 or "
+         "|intercept| ≤ 2 % of the response at the target"
+         if not multivariate else "RMSECV / RMSEP ≤ 2 % of the mean; no trend in residuals"],
+        ["Range", f"{lin[0]:g}–{lin[-1]:g} {unit} (target {target:g} {unit})",
+         "linearity, accuracy and precision acceptable over the whole range"],
+        ["Accuracy", f"3 levels × 3 replicates: {lv(acc)} (laboratory mixtures, or standard "
+                     "addition to the dosage form)",
+         "mean recovery 98–102 %; RSD ≤ 2 %"],
+        ["Repeatability", f"6 determinations at {target:g} {unit} (or the 3 × 3 accuracy "
+                          "set), same day, analyst, instrument",
+         "RSD ≤ 2 %"],
+        ["Intermediate precision", f"the 3 accuracy levels on 3 different days "
+                                   f"({lv(acc)})",
+         "RSD ≤ 2 %; one-way ANOVA between days not significant (p > 0.05)"],
+        ["LOD / LOQ", "from the calibration: 3.3σ/S and 10σ/S (σ = SD of the intercept or "
+                      "Sy/x); confirm the LOQ with 6 replicates"
+         + (f" (expected LOD ≈ {lod:.3g} {unit})" if np.isfinite(lod) else ""),
+         f"LOQ ≤ {lin[0]:g} {unit} (the lowest level); RSD at the LOQ ≤ 10 %"],
+    ]
+    rob = []
+    p = (measurement or {}).get("params", {})
+    for key in ("w1", "w2", "w3"):
+        if p.get(key) is not None:
+            rob.append(f"wavelength {p[key]:g} ± {wl_uncertainty:g} nm")
+    for key in ("p1", "p2"):
+        if p.get(key) is not None:
+            rob.append(f"plateau limit {p[key]:g} ± {wl_uncertainty:g} nm")
+    for st in steps or []:
+        sp = st.get("params", {})
+        if st.get("op") == "derivative" and sp.get("method", "difference") == "difference":
+            rob.append(f"Δλ {sp.get('delta_lambda', 4):g} ± 1 nm")
+        if st.get("op") == "derivative" and sp.get("method") == "savgol":
+            rob.append(f"S-G window {sp.get('window')} ± 2 points")
+        if st.get("op") in ("smooth_sg", "smooth_ma"):
+            rob.append(f"smoothing window {sp.get('window')} ± 2 points")
+    rob.append("a second batch of solvent; ±10 % in the dilution volume of the stock")
+    rows.append(["Robustness", "vary one factor at a time, 3 determinations each at the "
+                               f"target: {'; '.join(rob)} (Methods → Univariate → "
+                               "Robustness study does this automatically)",
+                 "recovery of each variation within ±2 % of the nominal; RSD ≤ 2 %"])
+    rows.append(["Comparison", "the dosage form by this method and by the official or a "
+                               "reported method, 5–6 determinations each",
+                 "Student's t and F below the tabulated values (Tools → Validation "
+                 "statistics → Compare methods / Compare (mean, SD, n))"])
+    if np.isfinite(expected_error):
+        rows.append(["Expected", f"the optimizer predicts an error of about "
+                                 f"{expected_error:.2f} % for this method",
+                     "recoveries much worse than this point to a preparation or "
+                     "instrument problem rather than the method"])
+    return rows

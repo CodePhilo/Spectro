@@ -266,3 +266,114 @@ def test_revising_a_result_creates_an_audited_new_version(project):
         project.revise_result(rid, "x", {}, "old version")
     assert project.audit_entries(action="REVISE")[0].reason == "outlier"
     assert project.verify()["ok"]
+
+
+def _assay(project):
+    """Y standards (one processed by D1), mixtures, a D1 method and a result."""
+    from spectro.core import univariate as uv
+    tid = project.add_trial("T")
+    std = [project.add_spectrum(mixture({"Y": v}, f"std {v}"), tid, role="standard")
+           for v in (2, 4, 6, 8, 10)]
+    mix = [project.add_spectrum(mixture({"X": 3, "Y": v}, f"mix {v}"), tid, role="mixture")
+           for v in (3, 5, 7)]
+    m = uv.UnivariateMethod("Y direct", "Y", [], {"kind": "amplitude", "params": {"w1": 350.0}})
+    m.calibrate(project.spectra(std), project.resolver())
+    d = m.to_dict()
+    d["calibration_ids"] = std
+    mid = project.save_method("Y direct", d, tid)
+    found = [[m.predict(s, project.resolver())] for s in project.spectra(mix)]
+    rid = project.save_result("Y assay", "routine", {"ids": mix, "compounds": ["Y"],
+                                                     "found": found}, tid, mid, mix)
+    return tid, std, mix, mid, rid
+
+
+def test_results_keep_taken_values_and_confidence_intervals(project):
+    from spectro.storage.tables import result_table
+    _, std, mix, mid, rid = _assay(project)
+    data = project.result(rid)["data"]
+    assert data["taken_snapshot"][str(mix[0])] == {"Y": 3}
+    reg = project.method(mid)["definition"]["regression"]
+    from spectro.core.validation import Regression
+    assert data["ci95"][0][0] == pytest.approx(
+        Regression.from_dict(reg).ci_at_x(data["found"][0][0]))
+    headers, rows, summary = result_table(project, data)
+    assert headers[:5] == ["Spectrum", "Y found", "Y ± 95 % CI", "Y taken", "Y recovery %"]
+    # a later correction does not silently change the stored recovery …
+    project.update_spectrum(mix[0], reason="typo", concentrations={"X": 3, "Y": 3.3})
+    _, rows2, summary2 = result_table(project, project.result(rid)["data"])
+    assert rows2[0][3] == 3 and rows2[0][4] == pytest.approx(rows[0][4])
+    assert any("changed after this result was saved" in x for x in summary2)
+
+
+def test_recalculate_all_affected_after_corrections(project):
+    from spectro.storage.recalc import recalculate_affected, stale_taken
+    _, std, mix, mid, rid = _assay(project)
+    project.update_spectrum(std[-1], reason="weighing", concentrations={"Y": 12.0})
+    out = recalculate_affected(project, [std[-1]], "standard re-weighed")
+    assert set(out["methods"]) == {mid} and set(out["results"]) == {rid}, out
+    new_m = project.method(out["methods"][mid])["definition"]
+    assert new_m["regression"]["x"][-1] == 12.0 and new_m["revision_of"] == mid
+    new_r = project.result(out["results"][rid])
+    assert new_r["method_id"] == out["methods"][mid] and not stale_taken(project, new_r["data"])
+    assert new_r["data"]["found"] != project.result(rid)["data"]["found"]
+
+    # processing correction: spectra are replaced, ids remapped in method and result
+    d1 = project.process(std + mix, [{"op": "smooth_sg", "params": {"window": 5, "order": 2}}])
+    from spectro.core import univariate as uv
+    m = uv.UnivariateMethod("Y sm", "Y", [], {"kind": "amplitude", "params": {"w1": 350.0}})
+    m.calibrate(project.spectra(d1[:5]), project.resolver())
+    d = m.to_dict()
+    d["calibration_ids"] = d1[:5]
+    mid2 = project.save_method("Y sm", d)
+    rid2 = project.save_result("Y sm assay", "routine",
+                               {"ids": d1[5:], "compounds": ["Y"],
+                                "found": [[m.predict(s)] for s in project.spectra(d1[5:])]},
+                               None, mid2, d1[5:])
+    mapping = project.revise_processing(d1, [{"op": "smooth_sg",
+                                              "params": {"window": 9, "order": 2}}], "wider")
+    out = recalculate_affected(project, [], "re-processed", mapping)
+    nm = project.method(out["methods"][mid2])["definition"]
+    assert nm["calibration_ids"] == [mapping[i] for i in d1[:5]]
+    nr = project.result(out["results"][rid2])["data"]
+    assert nr["ids"] == [mapping[i] for i in d1[5:]]
+
+
+def test_undo_restores_previous_versions(project, tmp_path):
+    _, std, mix, mid, rid = _assay(project)
+    # concentration edit (propagated) → undo
+    sm = project.process([mix[0]], [{"op": "smooth_sg", "params": {"window": 5, "order": 2}}])
+    project.update_spectrum(mix[0], reason="typo", concentrations={"X": 3, "Y": 4})
+    with pytest.raises(ValueError):
+        project.undo(project.undoable()[0].seq, "")
+    project.undo(project.undoable()[0].seq, "wrong spectrum")
+    assert project.record(mix[0]).concentrations == {"X": 3, "Y": 3}
+    assert project.record(sm[0]).concentrations == {"X": 3, "Y": 3}
+    # result revision → undo
+    r2 = project.revise_result(rid, "renamed", project.result(rid)["data"], "name")
+    e = project.undoable()[0]
+    assert e.action == "REVISE" and e.entity == "result"
+    project.undo(e.seq, "keep the old name")
+    assert [r["id"] for r in project.results()] == [rid]
+    assert project.result(r2)["archived"]
+    with pytest.raises(KeyError):
+        project.undo(e.seq, "twice")
+    # method revision that a later revision depends on cannot be undone first
+    m2 = project.revise_method(mid, "v2", project.method(mid)["definition"], "a")
+    m3 = project.revise_method(m2, "v3", project.method(m2)["definition"], "b")
+    first = next(x for x in project.undoable() if x.entity == "method"
+                 and x.details["after"]["id"] == m2)
+    with pytest.raises(ValueError):
+        project.undo(first.seq, "out of order")
+    project.undo(project.undoable()[0].seq, "undo v3")
+    project.undo(first.seq, "undo v2")
+    assert [m["id"] for m in project.methods()] == [mid]
+    assert project.method(m3)["archived"]
+    # re-processing → undo
+    mp = project.revise_processing(sm, [{"op": "smooth_sg", "params": {"window": 9}}], "w")
+    project.undo(project.undoable()[0].seq, "back")
+    assert not project.record(sm[0]).archived and project.record(mp[sm[0]]).archived
+    # archive → undo
+    project.archive_result(rid, "x")
+    project.undo(project.undoable()[0].seq, "oops")
+    assert [r["id"] for r in project.results()] == [rid]
+    assert project.verify()["ok"]

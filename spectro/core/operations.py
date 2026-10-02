@@ -15,11 +15,12 @@ turned into a :class:`Spectrum` by a *resolver* callable.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any, Callable
 
 import numpy as np
 from scipy import sparse
-from scipy.signal import savgol_filter
+
 from scipy.sparse.linalg import spsolve
 
 from spectro.core.spectrum import Spectrum
@@ -89,6 +90,52 @@ def _region_mean(s: Spectrum, start: float, end: float) -> float:
     return float(np.mean(s.region(start, end)[1]))
 
 
+@lru_cache(maxsize=256)
+def _savgol_matrices(window: int, polyorder: int, deriv: int):
+    """Convolution coefficients and the edge projection matrices of a
+    Savitzky–Golay filter (unit spacing). The edges reproduce SciPy's
+    ``mode='interp'`` exactly: a polynomial fitted to the first / last
+    ``window`` points, evaluated (or differentiated) at the edge points —
+    linear in the data, so it is one matrix product."""
+    from math import factorial
+
+    from scipy.signal import savgol_coeffs
+
+    coeffs = savgol_coeffs(window, polyorder, deriv=deriv, use="conv")
+    half = window // 2
+    t = np.arange(window, dtype=float) - (window - 1) / 2   # centred: well conditioned
+    vander = np.vander(t, polyorder + 1, increasing=True)
+    pinv = np.linalg.pinv(vander)
+
+    def evaluate(points):
+        d = np.zeros((len(points), polyorder + 1))
+        for k in range(deriv, polyorder + 1):
+            d[:, k] = factorial(k) / factorial(k - deriv) * points ** (k - deriv)
+        return d @ pinv
+    left = evaluate(t[:half])
+    right = evaluate(t[window - half:])
+    for a in (coeffs, left, right):
+        a.setflags(write=False)
+    return coeffs, left, right
+
+
+def savgol(y: np.ndarray, window: int, polyorder: int, deriv: int = 0,
+           delta: float = 1.0) -> np.ndarray:
+    """Savitzky–Golay filter, identical to ``scipy.signal.savgol_filter(...,
+    mode='interp')`` but with cached coefficients (≈ 10× faster for the many
+    short spectra of the optimizer)."""
+    y = np.asarray(y, dtype=float)
+    coeffs, left, right = _savgol_matrices(int(window), int(polyorder), int(deriv))
+    out = np.convolve(y, coeffs, mode="same")
+    half = window // 2
+    if half:
+        out[:half] = left @ y[:window]
+        out[-half:] = right @ y[-window:]
+    if deriv:
+        out /= delta ** deriv
+    return out
+
+
 def savgol_derivative(s: Spectrum, order: int, window: int, polyorder: int) -> np.ndarray:
     window = int(window) | 1
     if polyorder > 10:
@@ -104,12 +151,12 @@ def savgol_derivative(s: Spectrum, order: int, window: int, polyorder: int) -> n
     x = s.wavelengths
     d = np.diff(x)
     if np.ptp(d) <= 1e-6 * np.median(d):
-        return savgol_filter(s.values, window, polyorder, deriv=order, delta=float(np.median(d)))
+        return savgol(s.values, window, polyorder, deriv=order, delta=float(np.median(d)))
     # Savitzky–Golay assumes equal spacing: work on a regular grid at the finest
     # step, then return to the original wavelengths.
     step = float(np.min(d))
     reg = np.arange(x[0], x[-1] + step / 2, step)
-    y = savgol_filter(np.interp(reg, x, s.values), window, polyorder, deriv=order, delta=step)
+    y = savgol(np.interp(reg, x, s.values), window, polyorder, deriv=order, delta=step)
     return np.interp(x, reg, y)
 
 

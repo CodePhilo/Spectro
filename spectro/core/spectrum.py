@@ -34,6 +34,10 @@ class Spectrum:
             raise ValueError("a spectrum needs at least two points")
         if not (np.all(np.isfinite(x)) and np.all(np.isfinite(y))):
             raise ValueError("a spectrum cannot contain missing or infinite values")
+        dx = np.diff(x)
+        if np.all(dx > 0):          # already ascending and distinct (the usual case)
+            self.wavelengths, self.values = x, y
+            return
         order = np.argsort(x, kind="stable")
         x, y = x[order], y[order]
         if np.any(np.diff(x) == 0):  # repeated wavelengths: average the readings

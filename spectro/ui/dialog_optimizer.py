@@ -122,7 +122,13 @@ class OptimizerDialog(Base):
         row.addStretch(1)
         save = QPushButton("Save selected as method")
         save.clicked.connect(self._save)
+        plan = QPushButton("Validation plan…")
+        plan.setToolTip("An ICH Q2(R2) protocol for the selected method: levels over the "
+                        "range of your standards, replicates, robustness factors taken from "
+                        "the method's own settings, acceptance criteria")
+        plan.clicked.connect(self._plan)
         row.addWidget(save)
+        row.addWidget(plan)
         rl.addLayout(row)
         split = QSplitter(Qt.Vertical)
         self.table = PasteTable()
@@ -214,7 +220,8 @@ class OptimizerDialog(Base):
         try:
             self.inp = self._build_input()
             self.result = run_with_progress(self, "Screening processing strategies…",
-                                            optimize, inp=self.inp)
+                                            optimize, inp=self.inp,
+                                            workers=None)
         except InterruptedError:
             return
         except Exception as exc:
@@ -329,6 +336,58 @@ class OptimizerDialog(Base):
             "compounds cancel, or by subtracting the others from the recorded amplitude. "
             f"Predicted error with ±{self.inp.wl_uncertainty:g} nm: {c.robust_error:.2f} % "
             f"(noise {c.noise:.2f} %).")
+
+    # ------------------------------------------------------------ validation plan
+    def _plan(self):
+        from PySide6.QtWidgets import QDialog, QDialogButtonBox, QVBoxLayout
+
+        from spectro.core.validation import validation_plan
+        r = self.table.currentRow()
+        if not self.result or not 0 <= r < len(self.cands):
+            error(self, "Select a method in the ranking.")
+            return
+        c = self.cands[r]
+        comp = c.compound
+        concs = [rec.concentrations.get(comp) for rec in
+                 self.project.records(ids=self.std_ids.get(comp, []))]
+        concs = [v for v in concs if v]
+        unit = next((x.get("unit") for x in self.project.compounds()
+                     if x["name"] == comp and x.get("unit")), "µg/mL")
+        try:
+            rows = validation_plan(comp, min(concs, default=math.nan),
+                                   max(concs, default=math.nan), unit, c.label, c.steps,
+                                   c.measurement, self.inp.wl_uncertainty, c.score, c.lod,
+                                   multivariate=not c.measurement and c.family not in
+                                   ("amplitude_centering", "absorption_factor"))
+        except Exception as exc:
+            error(self, exc)
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Validation plan — {comp}")
+        dlg.resize(1150, 620)
+        lay = QVBoxLayout(dlg)
+        t = PasteTable()
+        fill_table(t, ["Parameter", "Design", "Acceptance criterion"], rows)
+        t.setTextElideMode(Qt.ElideNone)
+        t.setWordWrap(True)
+        t.setColumnWidth(0, 150)
+        t.setColumnWidth(1, 560)
+        t.horizontalHeader().setStretchLastSection(True)
+        t.export_title = f"Validation plan {comp}"
+        lay.addWidget(QLabel("ICH Q2(R2) protocol for the selected method. Right-click the "
+                             "table → Export to Excel to print it or fill in the results."))
+        lay.addWidget(t, 1)
+        bb = QDialogButtonBox(QDialogButtonBox.Close)
+        bb.rejected.connect(dlg.reject)
+        lay.addWidget(bb)
+        self.plan_rows = rows
+        self.project.log("CALCULATE", f"Validation plan for {comp}: {c.label}",
+                         {"method": c.label, "plan": rows})
+        self.plan_dialog = dlg
+        dlg.resize(dlg.size())
+        dlg.show()
+        t.resizeRowsToContents()
+        dlg.exec()
 
     # ------------------------------------------------------------ save
     def _save(self):

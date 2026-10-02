@@ -311,3 +311,50 @@ def test_greenness_formulas():
 def test_statistics_refuse_insufficient_or_invalid_input(call):
     with pytest.raises(ValueError):
         call()
+
+
+def test_outlier_tests_and_prediction_ci_match_miller_and_miller():
+    """Miller & Miller, Statistics and Chemometrics for Analytical Chemistry
+    (6th ed.): Q-test example 3.7.1, and the s_x0 examples of section 5.6."""
+    from spectro.core.validation import dixon, grubbs, linear_regression, validation_plan
+    v = [0.0403, 0.0410, 0.0401, 0.0380]
+    q = dixon(v)
+    assert q["Q"] == pytest.approx(0.70, abs=0.005) and not q["outlier"] and q["index"] == 3
+    g = grubbs(v)
+    assert g["G"] == pytest.approx(1.43, abs=0.01) and g["G_crit"] == pytest.approx(1.481,
+                                                                                     abs=0.001)
+    assert grubbs([100.1, 99.8, 100.3, 99.9, 100.0, 104.0])["outlier"]
+    with pytest.raises(ValueError):
+        dixon(list(range(12)))
+    r = linear_regression([0, 2, 4, 6, 8, 10, 12], [2.1, 5.0, 9.0, 12.6, 17.3, 21.0, 24.7])
+    t = 2.5706
+    for y0, x0, s in ((2.9, 0.72, 0.26), (13.5, 6.21, 0.24), (23.0, 11.13, 0.26)):
+        assert r.predict_x(y0) == pytest.approx(x0, abs=0.005)
+        assert r.ci_x(y0) / t == pytest.approx(s, abs=0.005)
+    plan = validation_plan("PAR", 2, 20, steps=[{"op": "derivative", "params": {
+        "delta_lambda": 4}}], measurement={"params": {"w1": 249.0}})
+    rows = {x[0]: x for x in plan}
+    assert "5 levels: 2, 5, 10, 15, 20 µg/mL" in rows["Linearity"][1]
+    assert "8, 10, 12 µg/mL" in rows["Accuracy"][1]
+    assert "249 ± 1 nm" in rows["Robustness"][1] and "Δλ 4 ± 1 nm" in rows["Robustness"][1]
+    with pytest.raises(ValueError):
+        validation_plan("PAR", 5, 5)
+
+
+def test_cached_savitzky_golay_equals_scipy():
+    from scipy.signal import savgol_filter
+
+    from spectro.core.operations import savgol
+    rng = np.random.default_rng(7)
+    for _ in range(200):
+        n = int(rng.integers(30, 400))
+        w = int(rng.integers(1, 15)) * 2 + 1
+        if w > n:
+            continue
+        p = int(rng.integers(0, min(5, w - 1) + 1))
+        d = int(rng.integers(0, min(p, 4) + 1))
+        dl = float(rng.uniform(0.2, 2))
+        y = np.cumsum(rng.normal(size=n))
+        ref = savgol_filter(y, w, p, deriv=d, delta=dl)
+        assert np.allclose(savgol(y, w, p, d, dl), ref, rtol=1e-8,
+                           atol=1e-9 * np.max(np.abs(ref)) + 1e-15)

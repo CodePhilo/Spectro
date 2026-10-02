@@ -16,7 +16,8 @@ from spectro.core import univariate as uv
 from spectro.core import validation as val
 from spectro.core.multicomponent import design_concentrations
 from spectro.ui.dialogs_data import Base
-from spectro.ui.dialogs_methods import SERIES, scatter, xy_plot
+from spectro.ui.dialogs_methods import scatter, xy_plot
+from spectro.ui.widgets import SERIES
 from spectro.ui.widgets import PasteTable, SpectrumPlot, error, fill_table
 
 

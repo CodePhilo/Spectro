@@ -323,6 +323,17 @@ def test_method_optimizer_dialog(win):
     d._save()
     saved = win.project.methods()[-1]["definition"]
     assert saved["type"] == "univariate" and saved["regression"]["r"] > 0.999
+    from PySide6.QtWidgets import QDialog
+    orig = QDialog.exec
+    QDialog.exec = lambda self: 0
+    try:
+        d._plan()
+    finally:
+        QDialog.exec = orig
+    plan = {r[0]: r for r in d.plan_rows}
+    assert "levels" in plan["Linearity"][1] and "Robustness" in plan
+    assert "± 1 nm" in plan["Robustness"][1] or "± 2 points" in plan["Robustness"][1] \
+        or "nm" in plan["Robustness"][1]
 
 
 def test_optimizer_ignores_mixtures_with_unselected_compounds(win):

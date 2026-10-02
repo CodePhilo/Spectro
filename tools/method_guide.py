@@ -561,7 +561,13 @@ class Guide:
         import spectro.ui.dialogs_tools as dt
         import spectro.ui.main_window as mw
         import spectro.ui.widgets as w
-        for mod in (w, dd, dm, dt, mw):
+        from importlib import import_module
+        from pkgutil import iter_modules
+
+        import spectro.ui.methods as pkg
+        methods = [import_module(f"spectro.ui.methods.{m.name}")
+                   for m in iter_modules(pkg.__path__)]
+        for mod in (w, dd, dm, dt, mw, *methods):
             mod.error = _raise
             setattr(mod, "ask_reason", lambda *a, **k: "guide")
         QMessageBox.information = staticmethod(lambda *a, **k: None)

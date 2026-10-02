@@ -238,6 +238,19 @@ class Demo:
                     "robustness, verified on simulated and laboratory mixtures — finds the best "
                     "method in seconds instead of weeks.",
                     "Tools → Method optimizer")
+        from PySide6.QtWidgets import QDialog
+        orig = QDialog.exec
+        QDialog.exec = lambda self: 0
+        try:
+            d._plan()
+        finally:
+            QDialog.exec = orig
+        self.s.shot(d.plan_dialog, "validation_plan", "Validation plan from the optimizer",
+                    "the selected method becomes an ICH Q2(R2) protocol: linearity levels over "
+                    "the range of your standards, accuracy and precision levels, LOD/LOQ, and "
+                    "robustness factors taken from the method's own settings — ready to print "
+                    "or export to Excel.",
+                    "Tools → Method optimizer → select a row → Validation plan…")
         for i in range(d.comps.count()):
             d.comps.item(i).setCheckState(Qt.Checked)
         d._refresh_inputs()
@@ -531,6 +544,20 @@ class Demo:
                     "marked), or recalculate with the current method and corrected "
                     "concentrations — saved as a new version, never overwritten.",
                     "Methods → Saved methods & results → Results → Edit…")
+        e._save()
+        from spectro.ui.dialogs_data import HistoryDialog, UndoDialog
+        h = HistoryDialog(self.win, "result", e.new_id)
+        h.table.selectRow(0)
+        self.s.shot(h, "history", "Version history of a method or result",
+                    "every version is kept: see what changed between any version and the "
+                    "latest, with the reason, and restore an older one as a new version.",
+                    "Methods → Saved methods & results → select → History…")
+        u = UndoDialog(self.win)
+        self.s.shot(u, "undo", "Undo a change",
+                    "restore the previous version of any recent edit, revision, re-processing "
+                    "or archiving — the undo is itself recorded in the audit trail.",
+                    "Edit → Undo a change… (Ctrl+Z)")
+        self.p.undo(u.entries[0].seq, "workflow demo: keep the original result")
 
     # 18
     def report(self):

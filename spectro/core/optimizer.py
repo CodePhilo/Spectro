@@ -470,8 +470,8 @@ def _smoothing_jobs(jobs: list[tuple], inp: OptimizerInput, grid: np.ndarray) ->
     return out
 
 
-def screen(inp: OptimizerInput, progress: Callable[[int, int], Any] | None = None
-           ) -> list[Candidate]:
+def screen(inp: OptimizerInput, progress: Callable[[int, int], Any] | None = None,
+           pool=None) -> list[Candidate]:
     """Fast screening of univariate processing families for every compound."""
     sc = _Screen(inp)
     fam = inp.families or set(FAMILIES)
@@ -547,29 +547,100 @@ def screen(inp: OptimizerInput, progress: Callable[[int, int], Any] | None = Non
                         {"op": "derivative", "params": {"order": 1, "delta_lambda": dl}}],
                         "single", None, f"÷ ({y}+{z}), D1 Δλ {dl:g} nm, at {{0}} nm"))
     jobs += _smoothing_jobs(jobs, inp, sc.grid)
+    if pool is not None and len(jobs) > 8:
+        return _parallel(pool, _screen_chunk, jobs, progress)
     out: list[Candidate] = []
-    for k, (t, family, steps, kind, ref, label) in enumerate(jobs):
+    for k, job in enumerate(jobs):
         if progress is not None and progress(k, len(jobs)) is False:
             raise InterruptedError("cancelled")
-        try:
-            picks = sc.single(t, steps) if kind == "single" else sc.pairs(t, steps, ref)
-        except Exception as exc:  # a family may not apply to these spectra
-            out.append(Candidate(t, family, FAMILIES[family], steps, error=str(exc)))
-            continue
-        for p in picks:
-            lam = p["lam"]
-            if kind == "single":
-                meas = {"kind": "amplitude", "params": {"w1": lam[0]}}
-            elif ref is None:
-                meas = {"kind": "difference", "params": {"w1": lam[0], "w2": lam[1]}}
-            else:
-                meas = {"kind": "weighted_difference",
-                        "params": {"w1": lam[0], "w2": lam[1], "reference": DIV + ref}}
-            out.append(Candidate(
-                t, family, f"{FAMILIES[family]}: " + label.format(*[_fmt_wl(v) for v in lam]),
-                steps, meas, predicted_error=p["err"], robust_error=p["robust"],
-                interference=p["bias"], noise=p["noise"], sensitivity=p["sens"]))
+        out += _run_job(sc, job)
     return out
+
+
+def _run_job(sc: "_Screen", job: tuple) -> list[Candidate]:
+    t, family, steps, kind, ref, label = job
+    try:
+        picks = sc.single(t, steps) if kind == "single" else sc.pairs(t, steps, ref)
+    except Exception as exc:  # a family may not apply to these spectra
+        return [Candidate(t, family, FAMILIES[family], steps, error=str(exc))]
+    out = []
+    for p in picks:
+        lam = p["lam"]
+        if kind == "single":
+            meas = {"kind": "amplitude", "params": {"w1": lam[0]}}
+        elif ref is None:
+            meas = {"kind": "difference", "params": {"w1": lam[0], "w2": lam[1]}}
+        else:
+            meas = {"kind": "weighted_difference",
+                    "params": {"w1": lam[0], "w2": lam[1], "reference": DIV + ref}}
+        out.append(Candidate(
+            t, family, f"{FAMILIES[family]}: " + label.format(*[_fmt_wl(v) for v in lam]),
+            steps, meas, predicted_error=p["err"], robust_error=p["robust"],
+            interference=p["bias"], noise=p["noise"], sensitivity=p["sens"]))
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Parallel execution (process pool; every worker rebuilds the same seeded
+# screen, so the result is identical to a serial run)
+# --------------------------------------------------------------------------- #
+_WORKER: dict[str, Any] = {}
+
+
+def _init_worker(inp: "OptimizerInput") -> None:
+    _WORKER["inp"] = inp
+    _WORKER["sc"] = _Screen(inp)
+    _WORKER["sims"] = simulated_mixtures(inp)
+
+
+def _screen_chunk(jobs: list[tuple]) -> list[list[Candidate]]:
+    return [_run_job(_WORKER["sc"], job) for job in jobs]
+
+
+def _verify_chunk(cands: list[Candidate]) -> list[list[Candidate]]:
+    return [[_verify_one(c, _WORKER["inp"], _WORKER["sc"].resolve, _WORKER["sims"])]
+            for c in cands]
+
+
+def _parallel(pool, fn, items: list, progress) -> list:
+    """Run ``fn`` on chunks of ``items`` in ``pool``; results keep the order."""
+    n = len(items)
+    size = max(1, min(16, n // (4 * getattr(pool, "_max_workers", 4)) or 1))
+    chunks = [items[i:i + size] for i in range(0, n, size)]
+    futures = [pool.submit(fn, ch) for ch in chunks]
+    done = 0
+    try:
+        for k, f in enumerate(futures):
+            res = f.result()
+            futures[k] = res
+            done += len(chunks[k])
+            if progress is not None and progress(done, n) is False:
+                raise InterruptedError("cancelled")
+    except BaseException:
+        for f in futures:
+            if hasattr(f, "cancel"):
+                f.cancel()
+        raise
+    return [c for chunk in futures for group in chunk for c in group]
+
+
+def make_pool(inp: "OptimizerInput", workers: int | None):
+    """A process pool for :func:`optimize`, or None to run serially."""
+    import multiprocessing as mp
+    import os
+    from concurrent.futures import ProcessPoolExecutor
+
+    if workers is None:
+        # spawning workers costs ~1 s each: worth it only for large screens
+        # (≥ 3 compounds with several smoothing widths)
+        size = len(inp.compounds) * (1 + len(inp.smoothing or ()))
+        n = min(4, os.cpu_count() or 1) if size >= 12 else 1
+    else:
+        n = workers
+    if n <= 1:
+        return None
+    return ProcessPoolExecutor(n, mp_context=mp.get_context("spawn"),
+                               initializer=_init_worker, initargs=(inp,))
 
 
 # --------------------------------------------------------------------------- #
@@ -597,34 +668,41 @@ def _rel_rmsep(pred, true) -> float:
     return float(100 * np.sqrt(np.mean(((pred[ok] - true[ok]) / true[ok]) ** 2)))
 
 
+def _verify_one(c: Candidate, inp: OptimizerInput, resolve, sims) -> Candidate:
+    if c.measurement is None:
+        return c
+    m = UnivariateMethod(c.label, c.compound, c.steps, c.measurement)
+    try:
+        reg = m.calibrate(inp.standards[c.compound], resolve)
+        c.r, c.slope, c.lod = reg.r, reg.slope, reg.lod
+        sp = [m.predict(s, resolve) for s in sims]
+        c.sim_rmsep = _rel_rmsep(sp, [s.concentrations[c.compound] for s in sims])
+        rr = [s for s in inp.mixtures if s.concentrations.get(c.compound)]
+        if rr:
+            f = np.array([m.predict(s, resolve) for s in rr])
+            t = np.array([s.concentrations[c.compound] for s in rr])
+            rec = 100 * f / t
+            c.real_rmsep = _rel_rmsep(f, t)
+            c.real_mean_recovery = float(rec.mean())
+            c.real_rsd = float(rec.std(ddof=1)) if rec.size > 1 else math.nan
+    except Exception as exc:
+        c.error = str(exc)
+        c.sim_rmsep = math.inf
+    return c
+
+
 def verify(cands: list[Candidate], inp: OptimizerInput, resolve,
-           progress: Callable[[int, int], Any] | None = None) -> list[Candidate]:
+           progress: Callable[[int, int], Any] | None = None, pool=None) -> list[Candidate]:
     """Calibrate each candidate on the real standards and predict the real and
     simulated mixtures (end-to-end)."""
+    if pool is not None and len(cands) > 8:
+        cands[:] = _parallel(pool, _verify_chunk, cands, progress)
+        return cands
     sims = simulated_mixtures(inp)
-    real = [m for m in inp.mixtures]
     for k, c in enumerate(cands):
         if progress is not None and progress(k, len(cands)) is False:
             raise InterruptedError("cancelled")
-        if c.measurement is None:
-            continue
-        m = UnivariateMethod(c.label, c.compound, c.steps, c.measurement)
-        try:
-            reg = m.calibrate(inp.standards[c.compound], resolve)
-            c.r, c.slope, c.lod = reg.r, reg.slope, reg.lod
-            sp = [m.predict(s, resolve) for s in sims]
-            c.sim_rmsep = _rel_rmsep(sp, [s.concentrations[c.compound] for s in sims])
-            rr = [s for s in real if s.concentrations.get(c.compound)]
-            if rr:
-                f = np.array([m.predict(s, resolve) for s in rr])
-                t = np.array([s.concentrations[c.compound] for s in rr])
-                rec = 100 * f / t
-                c.real_rmsep = _rel_rmsep(f, t)
-                c.real_mean_recovery = float(rec.mean())
-                c.real_rsd = float(rec.std(ddof=1)) if rec.size > 1 else math.nan
-        except Exception as exc:
-            c.error = str(exc)
-            c.sim_rmsep = math.inf
+        _verify_one(c, inp, resolve, sims)
     return cands
 
 
@@ -983,8 +1061,12 @@ def progressive(inp: OptimizerInput, sc: _Screen, resolve,
     return out
 
 
-def optimize(inp: OptimizerInput, progress: Callable[[int, int], Any] | None = None) -> dict:
-    """Screen + verify. Returns ranked candidates per compound and a summary."""
+def optimize(inp: OptimizerInput, progress: Callable[[int, int], Any] | None = None,
+             workers: int | None = 1) -> dict:
+    """Screen + verify. Returns ranked candidates per compound and a summary.
+
+    ``workers`` > 1 (or None = up to 4 CPU cores) screens and verifies in
+    parallel processes; the result is identical to a serial run."""
     def sub(offset, span):
         if progress is None:
             return None
@@ -992,10 +1074,15 @@ def optimize(inp: OptimizerInput, progress: Callable[[int, int], Any] | None = N
     for c in inp.compounds:
         for s in inp.standards[c]:
             s.concentrations = {**{k: 0.0 for k in inp.compounds}, **s.concentrations}
-    cands = screen(inp, sub(0, 50))
-    sc = _Screen(inp)
-    ok = [c for c in cands if not c.error]
-    verify(ok, inp, sc.resolve, sub(50, 25))
+    pool = make_pool(inp, workers)
+    try:
+        cands = screen(inp, sub(0, 50), pool)
+        sc = _Screen(inp)
+        ok = [c for c in cands if not c.error]
+        verify(ok, inp, sc.resolve, sub(50, 25), pool)
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
     prog = progressive(inp, sc, sc.resolve, sub(75, 15))
     multi = multivariate(inp, sc.resolve)
     if progress is not None:

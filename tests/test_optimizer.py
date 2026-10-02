@@ -213,3 +213,14 @@ def test_smoothing_reaches_progressive_methods():
     assert sm and plain
     assert sm[0].model["steps"][0]["op"] == "smooth_sg" and "SG smoothing" in sm[0].label
     assert min(x.real_rmsep for x in sm) < min(x.real_rmsep for x in plain)
+
+
+def test_parallel_optimizer_gives_the_serial_result():
+    comps, std, mixes = _noisy_binary()
+    inp = OptimizerInput(comps, std, {c: std[c][2] for c in comps}, mixes,
+                         families={"derivative", "ratio_difference"}, smoothing=(6.0,))
+    a = optimize(inp)
+    b = optimize(inp, workers=2)
+    for c in comps:
+        assert [(x.label, x.score) for x in a["ranked"][c]] == \
+            [(x.label, x.score) for x in b["ranked"][c]]

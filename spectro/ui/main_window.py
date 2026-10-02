@@ -185,6 +185,9 @@ class MainWindow(QMainWindow):
         act(m, "E&xit", self.close, "Ctrl+Q", False)
 
         m = mb.addMenu("&Edit")
+        act(m, "&Undo a change…", self.undo_dialog, "Ctrl+Z",
+            tip="Restore the previous version of a recent edit (kept in the audit trail)")
+        m.addSeparator()
         act(m, "&Trials…", self.edit_trials)
         act(m, "&Compounds…", self.edit_compounds)
         act(m, "Concentration &table for selection…", self.edit_concentrations, "Ctrl+T")
@@ -610,6 +613,9 @@ class MainWindow(QMainWindow):
         ids = self._need_selection()
         if ids:
             self._dialog("dialogs_data", "ProcessDialog", ids)
+
+    def undo_dialog(self):
+        self._dialog("dialogs_data", "UndoDialog")
 
     def edit_processing(self):
         ids = self._need_selection()

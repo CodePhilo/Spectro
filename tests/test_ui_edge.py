@@ -30,7 +30,11 @@ def messages(monkeypatch):
 
     def err(parent, exc, title="Spectro"):
         got.append(str(exc))
-    for mod in (w, dd, dm, dt, mw, do):
+    import spectro.ui.methods as pkg
+    from importlib import import_module
+    from pkgutil import iter_modules
+    methods = [import_module(f"spectro.ui.methods.{m.name}") for m in iter_modules(pkg.__path__)]
+    for mod in (w, dd, dm, dt, mw, do, *methods):
         monkeypatch.setattr(mod, "error", err, raising=False)
         monkeypatch.setattr(mod, "ask_reason", lambda *a, **k: "t", raising=False)
     from PySide6.QtWidgets import QInputDialog, QMessageBox
@@ -399,7 +403,8 @@ def test_results_concentrations_and_processing_can_be_edited(app, tmp_path, mess
     import spectro.ui.main_window as mw
     from spectro.ui.dialogs_methods import ResultEditDialog, SavedDialog, UnivariateDialog
     shown = []
-    monkeypatch.setattr(dd.QMessageBox, "information", lambda *a, **k: shown.append(a[2]))
+    monkeypatch.setattr(dd.QMessageBox, "question",
+                        lambda *a, **k: shown.append(a[2]) or dd.QMessageBox.No)
     win = mw.MainWindow()
     p = Project.create(tmp_path / "e.spectro")
     for c in ("X", "Y"):
@@ -480,6 +485,70 @@ def test_results_concentrations_and_processing_can_be_edited(app, tmp_path, mess
         assert not (set(sm) | set(d1)) & live
         for old in d1:
             assert p.replay(pd.mapping[old])["ok"]
+        assert not messages, messages
+    finally:
+        win.close_project()
+
+
+def test_undo_history_outliers_and_recalculate_all(app, tmp_path, messages, monkeypatch):
+    import spectro.ui.dialogs_data as dd
+    import spectro.ui.main_window as mw
+    from spectro.core import univariate as uv
+    from spectro.ui.dialogs_methods import ResultEditDialog
+    win = mw.MainWindow()
+    p = Project.create(tmp_path / "e.spectro")
+    p.add_compound("Y")
+    tid = p.add_trial("T")
+    std = [p.add_spectrum(mixture({"Y": v}, f"std {v}"), tid, role="standard")
+           for v in (2, 4, 6, 8, 10)]
+    mix = [p.add_spectrum(mixture({"Y": v}, f"mix {i}"), tid, role="mixture")
+           for i, v in enumerate((5, 5, 5, 5, 5, 6.5))]   # the last one reads 130 %
+    m = uv.UnivariateMethod("Y", "Y", [], {"kind": "amplitude", "params": {"w1": 350.0}})
+    m.calibrate(p.spectra(std), p.resolver())
+    d = m.to_dict()
+    d["calibration_ids"] = std
+    mid = p.save_method("Y", d, tid)
+    for sid in mix:
+        p.update_spectrum(sid, reason="label", concentrations={"Y": 5})
+    found = [[m.predict(s)] for s in p.spectra(mix)]
+    rid = p.save_result("assay", "routine", {"ids": mix, "compounds": ["Y"], "found": found},
+                        tid, mid, mix)
+    win._attach(p)
+    try:
+        e = ResultEditDialog(win, rid)
+        assert e.flagged and e.flagged[0][0] == mix[-1] and "outlier" in e.out_msg.text()
+        e.out_test.setCurrentIndex(1)        # Dixon
+        assert e.flagged and e.flagged[0][0] == mix[-1]
+        e._exclude_flagged()
+        assert e._excluded() == [mix[-1]] and "Dixon outlier" in e.excl_note.text()
+        assert not e.flagged                 # the rest is clean
+        assert e.table.horizontalHeaderItem(2).text() == "Y ± 95 % CI"
+        e._save()
+        r2 = e.new_id
+
+        # history: diff and restore
+        h = dd.HistoryDialog(win, "result", r2)
+        assert [v["id"] for v in h.versions] == [rid, r2]
+        h.table.selectRow(0)
+        assert "excluded_ids" in h.diff.toPlainText()
+        h._restore()
+        r3 = h.new_id
+        assert "excluded_ids" not in p.result(r3)["data"] and p.result(r3)["data"]["version"] == 3
+
+        # undo the restore
+        u = dd.UndoDialog(win)
+        assert u.entries[0].entity == "result"
+        u._undo()
+        assert [r["id"] for r in p.results()] == [r2]
+
+        # concentration correction of a standard → recalculate all affected (Yes)
+        c = dd.ConcentrationsDialog(win, [std[-1]])
+        c.table.item(0, 3).setText("11")
+        c._save()
+        assert p.methods()[0]["definition"]["revision_of"] == mid
+        res = p.results()[0]
+        assert res["data"]["revision_of"] == r2 and res["method_id"] == p.methods()[0]["id"]
+        assert res["data"]["excluded_ids"] == [mix[-1]]
         assert not messages, messages
     finally:
         win.close_project()

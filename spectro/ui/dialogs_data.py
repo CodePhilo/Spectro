@@ -39,10 +39,33 @@ def impact_text(project, ids) -> str:
     return "<br><br>".join(lines)
 
 
-def notify_impact(parent, project, ids, done: str) -> None:
-    text = impact_text(project, ids)
-    if text:
-        QMessageBox.information(parent, "Spectro", f"{done}<br><br>{text}")
+def notify_impact(parent, project, ids, done: str, mapping: dict | None = None) -> None:
+    """Tell what a correction affects and offer to bring it all up to date."""
+    text = impact_text(project, list(ids) + list(mapping or {}))
+    if not text:
+        return
+    ans = QMessageBox.question(
+        parent, "Spectro",
+        f"{done}<br><br>{text}<br><br><b>Recalculate all of them now?</b> Methods are "
+        "refitted on their calibration spectra and results recalculated with the current "
+        "method version — each as a new version (the old ones are archived).",
+        QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+    if ans != QMessageBox.Yes:
+        return
+    reason = ask_reason(parent, "Recalculate the affected methods and results?", required=True)
+    if not reason:
+        return
+    from spectro.storage.recalc import recalculate_affected
+    try:
+        out = recalculate_affected(project, ids, reason, mapping)
+    except Exception as exc:
+        error(parent, exc)
+        return
+    lines = [f"{len(out['methods'])} methods refitted, {len(out['results'])} results "
+             "recalculated."]
+    if out["skipped"]:
+        lines.append("Not updated:<br>" + "<br>".join(f"&nbsp;• {x}" for x in out["skipped"]))
+    QMessageBox.information(parent, "Spectro", "<br><br>".join(lines))
 
 
 def spectrum_choices(project):
@@ -589,9 +612,172 @@ class ProcessDialog(Base):
             f"Re-processed {len(self.ids)} spectra; {len(mapping) - len(self.ids)} downstream "
             "spectra rebuilt.")
         self.accept()
-        notify_impact(self.win, self.project, list(mapping),
-                      f"Processing changed: {len(mapping)} spectra replaced by new versions "
-                      "(the old ones are archived).")
+        notify_impact(self.win, self.project, [], f"Processing changed: {len(mapping)} "
+                      "spectra replaced by new versions (the old ones are archived).", mapping)
+
+
+# --------------------------------------------------------------------------- #
+# Undo and version history
+# --------------------------------------------------------------------------- #
+class UndoDialog(Base):
+    """Recent changes that can be undone. Undoing restores the previous
+    version; nothing is deleted and the undo is itself audited."""
+
+    def __init__(self, win):
+        super().__init__(win, "Undo a change")
+        self.resize(1000, 480)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("Recent edits, revisions, re-processing and archiving (newest "
+                             "first). Undo restores the previous version; a change that a "
+                             "later change builds on must be undone after it."))
+        self.table = QTableWidget()
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        lay.addWidget(self.table, 1)
+        bb = QDialogButtonBox(QDialogButtonBox.Close)
+        self.undo_btn = bb.addButton("Undo selected change…", QDialogButtonBox.ActionRole)
+        self.undo_btn.clicked.connect(self._undo)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+        self._load()
+
+    def _load(self):
+        self.entries = self.project.undoable()
+        fill_table(self.table, ["#", "Time (UTC)", "Action", "What", "Reason"],
+                   [[str(e.seq), e.ts_utc[:19].replace("T", " "), e.action, e.summary, e.reason]
+                    for e in self.entries])
+        if self.entries:
+            self.table.selectRow(0)
+        self.undo_btn.setEnabled(bool(self.entries))
+
+    def _undo(self):
+        r = self.table.currentRow()
+        if not 0 <= r < len(self.entries):
+            error(self, "Select a change.")
+            return
+        e = self.entries[r]
+        reason = ask_reason(self, f"Undo change #{e.seq}: {e.summary}?", required=True)
+        if not reason:
+            return
+        try:
+            msg = self.project.undo(e.seq, reason)
+        except Exception as exc:
+            error(self, exc)
+            return
+        self.win.statusBar().showMessage(msg)
+        self._load()
+
+
+class HistoryDialog(Base):
+    """All versions of a saved method or result, with the differences between
+    any version and the current one, and *Restore this version*."""
+
+    def __init__(self, win, kind: str, item_id: int):
+        super().__init__(win, f"Version history — {kind} #{item_id}")
+        self.resize(1150, 680)
+        self.kind = kind
+        self.versions = self._chain(item_id)
+        lay = QVBoxLayout(self)
+        split = QSplitter()
+        self.table = QTableWidget()
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        fill_table(self.table, ["#", "Version", "Name", "Created (UTC)", "State", "Reason"],
+                   [[str(v["id"]), str(self._body(v).get("version", 1)), v["name"],
+                     v["created_utc"][:19], "archived" if v["archived"] else "current",
+                     self._reason(v["id"])] for v in self.versions])
+        self.table.itemSelectionChanged.connect(self._show)
+        split.addWidget(self.table)
+        self.diff = QPlainTextEdit()
+        self.diff.setReadOnly(True)
+        self.diff.setStyleSheet("font-family: Consolas, 'DejaVu Sans Mono', monospace;")
+        split.addWidget(self.diff)
+        split.setSizes([480, 670])
+        lay.addWidget(split, 1)
+        bb = QDialogButtonBox(QDialogButtonBox.Close)
+        self.restore_btn = bb.addButton("Restore this version…", QDialogButtonBox.ActionRole)
+        self.restore_btn.clicked.connect(self._restore)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+        self.table.selectRow(len(self.versions) - 1)
+
+    def _get(self, i: int) -> dict:
+        return (self.project.method(i) if self.kind == "method"
+                else self.project.result(i))
+
+    def _body(self, v: dict) -> dict:
+        return v["definition"] if self.kind == "method" else v["data"]
+
+    def _chain(self, item_id: int) -> list[dict]:
+        """Oldest → newest: walk back through revision_of, then forward."""
+        cur = self._get(item_id)
+        back = [cur]
+        while self._body(back[-1]).get("revision_of"):
+            back.append(self._get(int(self._body(back[-1])["revision_of"])))
+        chain = list(reversed(back))
+        table = "methods" if self.kind == "method" else "results"
+        col = "definition" if self.kind == "method" else "data"
+        while True:
+            last = chain[-1]["id"]
+            nxt = [r[0] for r in self.project.conn.execute(
+                f"SELECT id, {col} FROM {table} WHERE id > ?", (last,))
+                if json.loads(r[1]).get("revision_of") == last]
+            if not nxt:
+                return chain
+            chain.append(self._get(nxt[0]))
+
+    def _reason(self, i: int) -> str:
+        for e in self.project.audit_entries(entity=self.kind, entity_id=i, action="REVISE"):
+            return e.reason
+        return ""
+
+    @staticmethod
+    def _text(v: dict, body: dict) -> list[str]:
+        b = {k: x for k, x in body.items() if k not in ("revision_of", "version")}
+        for key in ("regression",):
+            if isinstance(b.get(key), dict):
+                b[key] = {k: x for k, x in b[key].items() if k not in ("x", "y", "residuals")}
+        return [f"name: {v['name']}"] + json.dumps(b, indent=1, ensure_ascii=False,
+                                                    sort_keys=True).splitlines()
+
+    def _show(self):
+        import difflib
+
+        r = self.table.currentRow()
+        if not 0 <= r < len(self.versions):
+            return
+        v, cur = self.versions[r], self.versions[-1]
+        self.restore_btn.setEnabled(r != len(self.versions) - 1 and not cur["archived"])
+        if r == len(self.versions) - 1:
+            self.diff.setPlainText("This is the latest version.\n\n"
+                                   + "\n".join(self._text(v, self._body(v))))
+            return
+        lines = list(difflib.unified_diff(self._text(v, self._body(v)),
+                                          self._text(cur, self._body(cur)),
+                                          f"#{v['id']} (version {self._body(v).get('version', 1)})",
+                                          f"#{cur['id']} (latest)", lineterm="", n=2))
+        self.diff.setPlainText("Changes from this version to the latest "
+                               "(− this version, + latest):\n\n"
+                               + ("\n".join(lines) if lines else "no differences"))
+
+    def _restore(self):
+        r = self.table.currentRow()
+        v, cur = self.versions[r], self.versions[-1]
+        reason = ask_reason(self, f"Restore version #{v['id']} as a new version?",
+                            required=True)
+        if not reason:
+            return
+        body = {k: x for k, x in self._body(v).items() if k not in ("revision_of", "version")}
+        try:
+            if self.kind == "method":
+                self.new_id = self.project.revise_method(cur["id"], v["name"], body, reason)
+            else:
+                self.new_id = self.project.revise_result(cur["id"], v["name"], body, reason,
+                                                         v["method_id"])
+        except Exception as exc:
+            error(self, exc)
+            return
+        self.accept()
 
 
 # --------------------------------------------------------------------------- #

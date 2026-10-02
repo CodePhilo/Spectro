@@ -563,8 +563,12 @@ class Project:
             return {"ok": True, "message": "raw spectrum (nothing to replay)"}
         res = apply_pipeline(self.spectrum(rec.parent_ids[0]), rec.pipeline, self.resolver())
         stored = self.spectrum(sid)
+        # floating-point summation order may differ between library versions
+        # (e.g. the cached Savitzky–Golay); 1e-9 of the spectrum's magnitude is
+        # still ~10⁶ times below instrument noise
+        scale = float(np.max(np.abs(stored.values))) if stored.values.size else 0.0
         same = res.same_grid(stored) and bool(np.allclose(res.values, stored.values,
-                                                          rtol=1e-10, atol=1e-12))
+                                                          rtol=1e-9, atol=1e-9 * scale + 1e-15))
         self.log("VERIFY", f"Replayed processing of spectrum #{sid}: "
                            f"{'reproduced' if same else 'MISMATCH'}",
                  {"inputs": [rec.parent_ids[0]], "outputs": [sid], "reproduced": same},
@@ -617,27 +621,36 @@ class Project:
                              "inputs": list(before), "propagated_to": prop}, reason)
         self._notify("spectrum", None)
 
-    def descendants(self, sid: int, include_references: bool = False) -> list[int]:
+    def _children(self, include_references: bool = False) -> dict[int, list[int]]:
+        kids: dict[int, list[int]] = {}
+        for r in self.records():
+            if r.kind == "derived":
+                for p in (r.parent_ids if include_references else r.parent_ids[:1]):
+                    kids.setdefault(int(p), []).append(r.id)
+        return kids
+
+    def descendants(self, sid: int, include_references: bool = False,
+                    _kids: dict[int, list[int]] | None = None) -> list[int]:
         """Derived spectra made from ``sid`` (through any number of processing
         steps). By default only the processed versions of the same sample
         (first parent); with ``include_references`` also spectra that used it
         as a divisor/reference."""
-        out, todo = [], [int(sid)]
-        live = [r for r in self.records() if r.kind == "derived"]
+        kids = self._children(include_references) if _kids is None else _kids
+        out, seen, todo = [], {int(sid)}, [int(sid)]
         while todo:
-            cur = todo.pop()
-            for r in live:
-                ps = r.parent_ids if include_references else r.parent_ids[:1]
-                if cur in ps and r.id not in out:
-                    out.append(r.id)
-                    todo.append(r.id)
+            for k in kids.get(todo.pop(), []):
+                if k not in seen:
+                    seen.add(k)
+                    out.append(k)
+                    todo.append(k)
         return out
 
     def _propagate_concentrations(self, values: dict[int, dict]) -> list[int]:
         """Processed versions of a sample carry the sample's concentrations."""
         done = []
+        kids = self._children()
         for sid, conc in values.items():
-            for d in self.descendants(sid):
+            for d in self.descendants(sid, _kids=kids):
                 self.conn.execute("UPDATE spectra SET concentrations=? WHERE id=?",
                                   (_json(conc), d))
                 done.append(d)
@@ -662,7 +675,10 @@ class Project:
                 for v in obj:
                     yield from refs(v)
         methods = [m for m in self.methods() if ids & set(refs(m["definition"]))]
-        results = [r for r in self.results() if ids & set(refs(r["data"]))]
+        mids = {m["id"] for m in methods}
+        # results made with an affected method are affected too
+        results = [r for r in self.results()
+                   if ids & set(refs(r["data"])) or r["method_id"] in mids]
         return {"methods": methods, "results": results}
 
     def revise_processing(self, ids: list[int], steps: list[dict], reason: str,
@@ -823,6 +839,9 @@ class Project:
 
     def save_result(self, name: str, kind: str, data: dict, trial_id: int | None = None,
                     method_id: int | None = None, inputs: list[int] | None = None) -> int:
+        from spectro.storage.recalc import enrich
+
+        data = enrich(self, data, method_id)
         with self._tx():
             rid = self.conn.execute(
                 "INSERT INTO results (trial_id, method_id, name, kind, data, created_utc)"
@@ -870,10 +889,12 @@ class Project:
         old = self.result(rid)
         if old["archived"]:
             raise KeyError(f"result #{rid} is archived (an older version)")
-        data = dict(data)
+        from spectro.storage.recalc import enrich
+
+        mid = old["method_id"] if method_id is None else method_id
+        data = enrich(self, dict(data), mid)
         data["revision_of"] = rid
         data["version"] = int(old["data"].get("version", 1)) + 1
-        mid = old["method_id"] if method_id is None else method_id
         with self._tx():
             new = self.conn.execute(
                 "INSERT INTO results (trial_id, method_id, name, kind, data, created_utc)"
@@ -887,6 +908,94 @@ class Project:
                          "after": {"id": new, "name": name, "data": data}}, reason)
         self._notify("result", new)
         return int(new)
+
+    # ------------------------------------------------------------ undo
+    UNDOABLE = {("REVISE", "method"), ("REVISE", "result"), ("REVISE", "spectrum"),
+                ("EDIT", "spectrum"), ("ARCHIVE", "spectrum"), ("ARCHIVE", "method"),
+                ("ARCHIVE", "result")}
+
+    def undoable(self, limit: int = 30) -> list[AuditEntry]:
+        """Recent changes that can be undone (newest first), excluding those
+        already undone."""
+        done = {int(e.details.get("undoes")) for e in self.audit_entries(action="UNDO")
+                if e.details.get("undoes") is not None}
+        out = []
+        for e in self.audit_entries(limit=400):
+            if (e.action, e.entity) in self.UNDOABLE and e.seq not in done:
+                out.append(e)
+                if len(out) >= limit:
+                    break
+        return out
+
+    def undo(self, seq: int, reason: str) -> str:
+        """Undo one recorded change by restoring the previous version (nothing
+        is deleted: the undo is itself a new audited change). Refused when a
+        later change depends on it. Returns a summary."""
+        if not reason.strip():
+            raise ValueError("a reason is required")
+        e = next((x for x in self.undoable(limit=10 ** 6) if x.seq == seq), None)
+        if e is None:
+            raise KeyError(f"change #{seq} cannot be undone (unknown or already undone)")
+        d = e.details
+
+        def archived(table, i):
+            r = self.conn.execute(f"SELECT archived FROM {table} WHERE id=?", (i,)).fetchone()
+            if r is None:
+                raise KeyError(f"{table[:-1]} #{i} not found")
+            return bool(r[0])
+
+        def flag(table, i, v):
+            self.conn.execute(f"UPDATE {table} SET archived=? WHERE id=?", (int(v), i))
+
+        later = "a later change depends on it — undo that first"
+        with self._tx():
+            if e.action == "REVISE" and e.entity in ("method", "result"):
+                table = e.entity + "s"
+                new, old = int(d["after"]["id"]), int(d["before"]["id"])
+                if archived(table, new):
+                    raise ValueError(f"{e.entity} #{new} is no longer current: {later}")
+                flag(table, new, True)
+                flag(table, old, False)
+                summary = f"Undid revision of {e.entity}: #{new} archived, #{old} restored"
+            elif e.action == "REVISE":
+                rep = {int(k): int(v) for k, v in d["replaced"].items()}
+                if any(archived("spectra", v) for v in rep.values()):
+                    raise ValueError(f"the re-processed spectra changed again: {later}")
+                for k, v in rep.items():
+                    flag("spectra", v, True)
+                    flag("spectra", k, False)
+                summary = f"Undid re-processing: {len(rep)} spectra restored to their " \
+                          "previous version"
+            elif e.action == "EDIT":
+                if e.entity_id is not None:
+                    edits = {int(e.entity_id): (d["before"], d["after"])}
+                else:
+                    edits = {int(k): ({"concentrations": v},
+                                      {"concentrations": d["after"][k]})
+                             for k, v in d["before"].items()}
+                for sid, (before, after) in edits.items():
+                    rec = self.record(sid)
+                    for k, v in after.items():
+                        if getattr(rec, k) != v:
+                            raise ValueError(f"'{rec.name}' {k} changed again: {later}")
+                for sid, (before, _) in edits.items():
+                    for k, v in before.items():
+                        val = _json(v) if k in ("concentrations", "metadata") else v
+                        self.conn.execute(f"UPDATE spectra SET {k}=? WHERE id=?", (val, sid))
+                    if "concentrations" in before:
+                        self._propagate_concentrations({sid: before["concentrations"]})
+                summary = f"Undid edit of {len(edits)} spectra"
+            else:  # ARCHIVE
+                table = {"spectrum": "spectra", "method": "methods", "result": "results"}[
+                    e.entity]
+                ids = d.get("inputs") or [e.entity_id]
+                for i in ids:
+                    flag(table, int(i), False)
+                summary = f"Undid archiving of {len(ids)} {e.entity}(s)"
+            self._audit("UNDO", e.entity, e.entity_id, f"{summary} (change #{seq})",
+                        {"undoes": seq, "undone_action": e.action}, reason)
+        self._notify(e.entity, None)
+        return summary
 
     def results(self, trial_id: int | None = None) -> list[dict]:
         q = "SELECT id, trial_id, method_id, name, kind, data, created_utc FROM results WHERE archived=0"

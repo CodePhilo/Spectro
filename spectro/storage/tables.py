@@ -21,34 +21,40 @@ def _num(v: Any) -> Any:
 def result_table(project, data: dict) -> tuple[list[str], list[list[Any]], list[str]]:
     """(headers, rows, summary lines) for a stored result.
 
-    Concentration results (``ids`` + ``found``) become found / taken /
-    recovery columns per compound; anything else is flattened to key/value."""
-    ids, found = data.get("ids"), data.get("found")
-    if ids and isinstance(found, list) and found and isinstance(found[0], dict):
-        comps = [data.get("X", "X"), data.get("Y", "Y")]
-        found = [[f.get("X"), f.get("Y")] for f in found]
-    else:
-        comps = data.get("compounds") or ([data["method"]["compound"]]
-                                          if isinstance(data.get("method"), dict)
-                                          and data["method"].get("compound") else None)
-    if ids and comps and isinstance(found, list) and found and isinstance(found[0], list):
-        headers = ["Spectrum"] + [h for c in comps for h in
-                                  (f"{c} found", f"{c} taken", f"{c} recovery %")]
+    Concentration results (``ids`` + ``found``) become found / ±95 % CI /
+    taken / recovery columns per compound; anything else is flattened to
+    key/value. The taken values are those stored with the result when it was
+    saved; a later correction of the spectra is reported, not applied."""
+    from spectro.storage.recalc import compounds_of, found_rows, stale_taken
+
+    ids = data.get("ids")
+    comps, found = compounds_of(data), found_rows(data)
+    if ids and comps and found:
+        ci = data.get("ci95")
+        snap = data.get("taken_snapshot") or {}
+        headers = ["Spectrum"]
+        for c in comps:
+            headers += [f"{c} found"] + ([f"{c} ± 95 % CI"] if ci else []) + \
+                [f"{c} taken", f"{c} recovery %"]
         excluded = {int(i) for i in data.get("excluded_ids") or []}
         rows, recs = [], {c: [] for c in comps}
-        for sid, f in zip(ids, found):
+        for k, (sid, f) in enumerate(zip(ids, found)):
             try:
                 rec = project.record(int(sid))
             except (KeyError, TypeError, ValueError):
                 continue
             out = int(sid) in excluded
             row: list[Any] = [rec.name + (" (excluded)" if out else "")]
-            for c, v in zip(comps, f):
-                t = rec.concentrations.get(c)
+            taken = snap.get(str(int(sid)))
+            for j, (c, v) in enumerate(zip(comps, f)):
+                t = taken.get(c) if taken is not None else rec.concentrations.get(c)
                 r = 100 * v / t if (t and v is not None) else None
                 if r is not None and not out:
                     recs[c].append(r)
-                row += [_num(v), t, r]
+                row.append(_num(v))
+                if ci:
+                    row.append(ci[k][j] if k < len(ci) and j < len(ci[k]) else None)
+                row += [t, r]
             rows.append(row)
         summary = []
         for c, v in recs.items():
@@ -61,6 +67,15 @@ def result_table(project, data: dict) -> tuple[list[str], list[list[Any]], list[
             summary.append(f"{n_ex} {'spectrum' if n_ex == 1 else 'spectra'} excluded from "
                            "the statistics" + (f": {data['exclusion_note']}"
                                                if data.get("exclusion_note") else ""))
+        stale = stale_taken(project, data)
+        if stale:
+            n = len({s_ for s_, *_ in stale})
+            summary.append(f"⚠ The concentrations of {n} {'spectrum' if n == 1 else 'spectra'} "
+                           "changed after this result was saved; the table shows the values "
+                           "used at the time. Edit… → Recalculate to update it.")
+        if ci:
+            summary.append("± 95 % CI: confidence interval of each found value from the "
+                           "calibration line (s_x0 · t, one measurement)")
         if data.get("notes"):
             summary.append(f"Notes: {data['notes']}")
         return headers, rows, summary
@@ -73,7 +88,7 @@ def _flatten(obj: Any, prefix: str = "") -> list[tuple[str, Any]]:
     if isinstance(obj, dict):
         out: list[tuple[str, Any]] = []
         for k, v in obj.items():
-            if k not in ("x", "y", "residuals", "steps"):
+            if k not in ("x", "y", "residuals", "steps", "taken_snapshot"):
                 out += _flatten(v, f"{prefix}.{k}" if prefix else str(k))
         return out
     if isinstance(obj, list):
