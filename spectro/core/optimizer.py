@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import itertools
 import math
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -129,6 +130,10 @@ class OptimizerInput:
     pair_step: float = 2.0
     keep_per_family: int = 1
     seed: int = 0
+    # Savitzky–Golay smoothing widths (nm) to try in front of every univariate
+    # strategy, plus Savitzky–Golay derivatives of the same widths; () = none
+    smoothing: tuple[float, ...] = ()
+    smoothing_order: int = 2
 
 
 # --------------------------------------------------------------------------- #
@@ -412,6 +417,59 @@ def _fmt_wl(v: float) -> str:
     return f"{v:.1f}".rstrip("0").rstrip(".")
 
 
+def sg_window(width_nm: float, step: float, minimum: int = 5) -> int:
+    """Odd number of points covering ``width_nm`` on a grid of ``step`` nm."""
+    n = int(round(width_nm / step))
+    n = max(minimum, n)
+    return n if n % 2 else n + 1
+
+
+def _smoothing_jobs(jobs: list[tuple], inp: OptimizerInput, grid: np.ndarray) -> list[tuple]:
+    """Variants of the screening jobs with Savitzky–Golay smoothing.
+
+    * every job again with a smoothing step in front (smoothing is linear, so
+      the interference / noise / ±λ analysis stays exact: a smoothing that
+      distorts the bands shows up as interference, one that only removes
+      noise as a lower noise term);
+    * derivative jobs again with Savitzky–Golay derivatives (smoothing and
+      differentiation in one step) instead of the Δλ difference derivative.
+    """
+    if not inp.smoothing:
+        return []
+    step = float(np.median(np.diff(grid)))
+    out = []
+    for width in inp.smoothing:
+        win = sg_window(width, step)
+        if win >= grid.size // 2:
+            continue
+        p = min(int(inp.smoothing_order), win - 2)
+        smooth = {"op": "smooth_sg", "params": {"window": win, "polyorder": p}}
+        tag = f"SG smoothing {width:g} nm ({win} pts, order {p}) → "
+        for t, family, steps, kind, ref, label in jobs:
+            out.append((t, family, [smooth] + steps, kind, ref, tag + label))
+        # Savitzky–Golay derivatives replacing the difference derivatives
+        seen = set()
+        for t, family, steps, kind, ref, label in jobs:
+            if not any(st["op"] == "derivative" for st in steps):
+                continue
+            new, txt = [], label
+            for st in steps:
+                if st["op"] == "derivative":
+                    n = int(st["params"]["order"])
+                    po = min(max(n + 1, 3), win - 2, 10)
+                    st = {"op": "derivative",
+                          "params": {"order": n, "method": "savitzky_golay", "window": win,
+                                     "polyorder": po}}
+                    txt = re.sub(r"Δλ [\d.]+ nm", f"S-G {width:g} nm ({win} pts, order {po})",
+                                 label)
+                new.append(st)
+            key = (t, family, txt)
+            if key not in seen:      # the Δλ variants collapse into one S-G job
+                seen.add(key)
+                out.append((t, family, new, kind, ref, txt))
+    return out
+
+
 def screen(inp: OptimizerInput, progress: Callable[[int, int], Any] | None = None
            ) -> list[Candidate]:
     """Fast screening of univariate processing families for every compound."""
@@ -488,6 +546,7 @@ def screen(inp: OptimizerInput, progress: Callable[[int, int], Any] | None = Non
                                                         "reference2": DIV + z}},
                         {"op": "derivative", "params": {"order": 1, "delta_lambda": dl}}],
                         "single", None, f"÷ ({y}+{z}), D1 Δλ {dl:g} nm, at {{0}} nm"))
+    jobs += _smoothing_jobs(jobs, inp, sc.grid)
     out: list[Candidate] = []
     for k, (t, family, steps, kind, ref, label) in enumerate(jobs):
         if progress is not None and progress(k, len(jobs)) is False:
@@ -601,6 +660,18 @@ def multivariate(inp: OptimizerInput, resolve) -> list[Candidate]:
     if "pls" in fam and len(train) >= len(comps) + 3:
         models.append(("pls", "", SpectralModel("PLS2", comps, ranges=[(float(grid[0]),
                                                                         float(grid[-1]))])))
+    if inp.smoothing:
+        step = float(np.median(np.diff(grid)))
+        for family, detail, model in list(models):
+            for width in inp.smoothing:
+                win = sg_window(width, step)
+                if win >= grid.size // 2:
+                    continue
+                p = min(int(inp.smoothing_order), win - 2)
+                twin = type(model).from_dict(model.to_dict())
+                twin.steps = [{"op": "smooth_sg", "params": {"window": win, "polyorder": p}}]
+                tag = f"SG smoothing {width:g} nm ({win} pts, order {p}) → "
+                models.append((family, tag + detail, twin))
     out = []
     for family, detail, model in models:
         try:
@@ -609,7 +680,9 @@ def multivariate(inp: OptimizerInput, resolve) -> list[Candidate]:
                                           max_components=min(10, len(train) - 2))
                 model.n_components = cv["suggested_components"]
                 model.fit(train, resolve)
-                detail = f"{model.n_components} LVs, {_fmt_wl(grid[0])}–{_fmt_wl(grid[-1])} nm"
+                tag = detail.split("→")[0] + "→ " if "→" in detail else ""
+                detail = (f"{tag}{model.n_components} LVs, "
+                          f"{_fmt_wl(grid[0])}–{_fmt_wl(grid[-1])} nm")
             elif isinstance(model, SignalEquations):
                 model.fit(pure, resolve)
             else:

@@ -8,7 +8,7 @@ import math
 import numpy as np
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QGroupBox, QHBoxLayout, QLabel,
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QGroupBox, QHBoxLayout, QLabel,
                                QLineEdit, QListWidget, QListWidgetItem, QPushButton, QSplitter,
                                QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
@@ -72,6 +72,24 @@ class OptimizerDialog(Base):
         row.addWidget(self.range, 1)
         row.addWidget(QLabel("λ uncertainty ±"))
         row.addWidget(self.unc)
+        gl.addLayout(row)
+        row = QHBoxLayout()
+        self.smooth = QCheckBox("Also try Savitzky–Golay smoothing, widths (nm):")
+        self.smooth.setChecked(True)
+        self.smooth.setToolTip(
+            "Every strategy is screened again with Savitzky–Golay smoothing in front (and "
+            "derivatives as Savitzky–Golay derivatives). The ranking shows whether smoothing "
+            "removes more noise than it distorts the bands. Widths are in nm and converted to "
+            "points for your data interval. Screening takes longer.")
+        self.smooth_w = QLineEdit("3, 6, 10")
+        self.smooth_w.setMaximumWidth(110)
+        self.smooth_p = QComboBox()
+        self.smooth_p.addItems(["order 2", "order 3"])
+        self.smooth.toggled.connect(self.smooth_w.setEnabled)
+        self.smooth.toggled.connect(self.smooth_p.setEnabled)
+        for w in (self.smooth, self.smooth_w, self.smooth_p):
+            row.addWidget(w)
+        row.addStretch(1)
         gl.addLayout(row)
         self.fam = QListWidget()
         for key, label in FAMILIES.items():
@@ -174,12 +192,22 @@ class OptimizerDialog(Base):
             rng = (float(a), float(b))
         fam = {self.fam.item(i).data(Qt.UserRole) for i in range(self.fam.count())
                if self.fam.item(i).checkState() == Qt.Checked}
+        widths: tuple[float, ...] = ()
+        if self.smooth.isChecked():
+            try:
+                widths = tuple(float(w) for w in
+                               self.smooth_w.text().replace(";", ",").split(",") if w.strip())
+            except ValueError:
+                raise ValueError("smoothing widths: give numbers in nm, e.g. 3, 6, 10") from None
+            if any(w <= 0 for w in widths):
+                raise ValueError("smoothing widths must be positive")
         return OptimizerInput(
             comps, {c: self.project.spectra(self.std_ids[c]) for c in comps},
             {c: self.project.spectrum(self.div_boxes[c].currentData()) for c in comps},
             self.project.spectra(self.mix.checked_ids()),
             self.project.spectra(self.train.checked_ids()),
-            wl_range=rng, wl_uncertainty=self.unc.value(), families=fam)
+            wl_range=rng, wl_uncertainty=self.unc.value(), families=fam, smoothing=widths,
+            smoothing_order=2 + self.smooth_p.currentIndex())
 
     # ------------------------------------------------------------ run
     def _run(self):

@@ -123,3 +123,75 @@ def test_materialize_replaces_the_progressive_divisor():
     d = materialize(Candidate("X", "amplitude_centering", "", model=m.to_dict()),
                     {"X": 3, "Z": 7})
     assert d["model"]["divisor"] == 7
+
+
+# --------------------------------------------------------------------------- #
+# Smoothing options
+# --------------------------------------------------------------------------- #
+def test_sg_window_converts_nm_to_odd_points():
+    from spectro.core.optimizer import sg_window
+    assert sg_window(6, 0.5) == 13
+    assert sg_window(10, 1.0) == 11
+    assert sg_window(1, 1.0) == 5          # never below 5 points
+    assert all(sg_window(w, s) % 2 == 1 for w in (2, 3, 7.3) for s in (0.1, 0.5, 2))
+
+
+def _noisy_binary(noise=0.003):
+    comps = ["X", "Y"]
+    std = {c: [mixture({k: (v if k == c else 0.0) for k in comps}, f"{c} {v}", noise,
+                       seed=int(v) * 3 + len(c)) for v in (4, 8, 12, 16, 20)] for c in comps}
+    mixes = [mixture({"X": a, "Y": b}, f"m{a}{b}", noise, seed=a * 10 + b)
+             for a, b in [(6, 10), (10, 6), (14, 14), (8, 16), (18, 5)]]
+    return comps, std, mixes
+
+
+def test_smoothing_variants_are_screened_and_help_noisy_derivatives():
+    """With noisy spectra (0.003 AU) smoothing must lower the error of the
+    best derivative methods on the LABORATORY mixtures (independent noise),
+    not only in the prediction."""
+    from spectro.core.univariate import UnivariateMethod
+    comps, std, mixes = _noisy_binary()
+    fam = {"derivative", "derivative_ratio", "ratio_difference"}
+    plain = optimize(OptimizerInput(comps, std, {c: std[c][2] for c in comps}, mixes,
+                                    families=fam))
+    smooth = optimize(OptimizerInput(comps, std, {c: std[c][2] for c in comps}, mixes,
+                                     families=fam, smoothing=(3.0, 6.0, 10.0)))
+    assert not any(st["op"] == "smooth_sg" for c in comps for x in plain["ranked"][c]
+                   for st in x.steps)
+    for c in comps:
+        for f in fam:
+            best_plain = next(x for x in plain["ranked"][c] if x.family == f and not x.error)
+            best_smooth = next(x for x in smooth["ranked"][c] if x.family == f and not x.error)
+            assert best_smooth.real_rmsep <= best_plain.real_rmsep + 1e-9, (c, f)
+        ranked = smooth["ranked"][c]
+        assert any(x.steps and x.steps[0]["op"] == "smooth_sg" for x in ranked)
+        sgd = [x for x in ranked if any(st["op"] == "derivative" and
+                                        st["params"].get("method") == "savitzky_golay"
+                                        for st in x.steps)]
+        assert sgd and all("S-G" in x.label for x in sgd)
+    # the derivative winner improves a lot here
+    for c in comps:
+        bp = next(x for x in plain["ranked"][c] if x.family == "derivative" and not x.error)
+        bs = next(x for x in smooth["ranked"][c] if x.family == "derivative" and not x.error)
+        assert bs.real_rmsep < 0.6 * bp.real_rmsep
+    # a smoothed winner becomes a working method
+    best = next(x for x in smooth["ranked"]["X"] if x.measurement and x.steps
+                and x.steps[0]["op"] == "smooth_sg")
+    d = materialize(best, {"X": 1, "Y": 2})
+    lib = {1: std["X"][2], 2: std["Y"][2]}
+    m = UnivariateMethod("smoothed", "X", d["steps"], d["measurement"])
+    m.calibrate(std["X"], lib.__getitem__)
+    rec = [100 * m.predict(s, lib.__getitem__) / s.concentrations["X"] for s in mixes]
+    assert all(abs(r - 100) < 5 for r in rec)
+
+
+def test_smoothing_also_applies_to_multicomponent_models():
+    comps, std, mixes = _noisy_binary()
+    res = optimize(OptimizerInput(comps, std, {c: std[c][2] for c in comps}, mixes,
+                                  families={"vierordt", "cls"}, smoothing=(6.0,)))
+    labels = [x.label for x in res["ranked"]["X"]]
+    assert any(lab.startswith("Classical least squares") and "SG smoothing 6 nm" in lab
+               for lab in labels)
+    assert any(lab.startswith("Vierordt") and "SG smoothing 6 nm" in lab for lab in labels)
+    smoothed = next(x for x in res["ranked"]["X"] if "SG smoothing" in x.label)
+    assert smoothed.model["steps"][0]["op"] == "smooth_sg"

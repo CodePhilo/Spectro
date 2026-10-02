@@ -304,6 +304,15 @@ def test_method_optimizer_dialog(win):
     assert "Recommendations" in d.summary.text()
     best = d.cands[0]
     assert best.score < 3
+    assert d.smooth.isChecked() and d.inp.smoothing == (3.0, 6.0, 10.0)
+    assert any("SG smoothing" in c.label for c in d.cands)
+    d.smooth_w.setText("6, x")
+    try:
+        d._build_input()
+        raise AssertionError("bad widths accepted")
+    except ValueError as exc:
+        assert "smoothing widths" in str(exc)
+    d.smooth_w.setText("3, 6, 10")
     d.table.selectRow(0)
     d._explain()
     n = len(win.project.methods())
