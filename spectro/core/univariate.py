@@ -637,6 +637,7 @@ class _Progressive:
     a resolver for the stored divisor reference."""
 
     compounds: list[str]
+    steps: list[dict]
 
     @property
     def is_fitted(self) -> bool:
@@ -645,15 +646,39 @@ class _Progressive:
     def _divisor(self, resolve: Resolver | None):
         return None
 
+    def _pre(self, s: Spectrum | None, resolve: Resolver | None):
+        """Optional pre-processing (e.g. smoothing) of standards, divisor and samples."""
+        if s is None or not self.steps:
+            return s
+        return apply_pipeline(s, self.steps, resolve)
+
+    def _processed_divisor(self, resolve):
+        return self._pre(self._divisor(resolve), resolve)
+
     def fit_spectra(self, spectra: list[Spectrum], resolve: Resolver | None = None) -> dict:
-        return self._fit(pure_standards(spectra, self.compounds), self._divisor(resolve))
+        proc = [self._pre(s, resolve) for s in spectra]
+        return self._fit(pure_standards(proc, self.compounds), self._processed_divisor(resolve))
 
     def predict_spectra(self, spectra: list[Spectrum], resolve: Resolver | None = None
                         ) -> np.ndarray:
-        div = self._divisor(resolve)
-        rows = [self._predict(s, div) for s in spectra]
+        div = self._processed_divisor(resolve)
+        rows = [self._predict(self._pre(s, resolve), div) for s in spectra]
         return np.array([[r[c] for c in self.compounds] for r in rows], float).reshape(
             len(rows), len(self.compounds))
+
+    def predict_one(self, s: Spectrum, resolve: Resolver | None = None) -> dict[str, float]:
+        return dict(zip(self.compounds, self.predict_spectra([s], resolve)[0]))
+
+    def _steps_text(self) -> str:
+        from spectro.core.operations import describe_step
+        out = ""
+        for st in self.steps:
+            if st["op"] == "smooth_sg":
+                q = st["params"]
+                out += f"SG smoothing ({q['window']} pts, order {q['polyorder']}) → "
+            else:
+                out += describe_step(st) + " → "
+        return out
 
 
 @dataclass
@@ -696,6 +721,7 @@ class AmplitudeCentering(_Progressive):
     regressions: dict[str, Regression] = field(default_factory=dict)
     divisor: Any = None        # stored reference of the divisor spectrum (saved methods)
     name: str = ""
+    steps: list[dict] = field(default_factory=list)   # pre-processing, e.g. smoothing
 
     def _divisor(self, resolve: Resolver | None) -> Spectrum:
         d = self.divisor
@@ -800,7 +826,7 @@ class AmplitudeCentering(_Progressive):
                 "diff_regressions": {c: r.to_dict() for c, r in self.diff_regressions.items()},
                 "regressions": {c: r.to_dict() for c, r in self.regressions.items()},
                 "divisor": None if isinstance(self.divisor, Spectrum) else self.divisor,
-                "name": self.name}
+                "name": self.name, "steps": copy.deepcopy(self.steps)}
 
     @classmethod
     def from_dict(cls, d: dict) -> "AmplitudeCentering":
@@ -810,10 +836,11 @@ class AmplitudeCentering(_Progressive):
                    d.get("unified", False), dict(d.get("factors", {})),
                    {c: Regression.from_dict(r) for c, r in d.get("diff_regressions", {}).items()},
                    {c: Regression.from_dict(r) for c, r in d.get("regressions", {}).items()},
-                   d.get("divisor"), d.get("name", ""))
+                   d.get("divisor"), d.get("name", ""), copy.deepcopy(d.get("steps", [])))
 
     def describe(self) -> str:
-        parts = [f"÷ {self.divisor_compound or 'divisor'}, λc {self.wavelength:.1f} nm"]
+        parts = [f"{self._steps_text()}÷ {self.divisor_compound or 'divisor'}, "
+                 f"λc {self.wavelength:.1f} nm"]
         if self.plateau:
             parts.append(f"{self.divisor_compound} from plateau "
                          f"{self.plateau[0]:.0f}–{self.plateau[1]:.0f} nm")
@@ -844,6 +871,7 @@ class AbsorptionFactorMethod(_Progressive):
     factors: dict[str, dict[str, float]] = field(default_factory=dict)
     regressions: dict[str, Regression] = field(default_factory=dict)
     name: str = ""
+    steps: list[dict] = field(default_factory=list)   # pre-processing, e.g. smoothing
 
     @property
     def compounds(self) -> list[str]:
@@ -856,7 +884,7 @@ class AbsorptionFactorMethod(_Progressive):
         return self.predict(s)
 
     def describe(self) -> str:
-        return " → ".join(f"{c} at {w:.1f} nm" + (f" (read at {self.quant[c]:.1f})"
+        return self._steps_text() + " → ".join(f"{c} at {w:.1f} nm" + (f" (read at {self.quant[c]:.1f})"
                                                    if self.quant.get(c) else "")
                           for c, w in self.order)
 
@@ -894,14 +922,14 @@ class AbsorptionFactorMethod(_Progressive):
         return {"type": "absorption_factor", "order": [list(o) for o in self.order],
                 "compounds": self.compounds, "quant": self.quant, "factors": self.factors,
                 "regressions": {c: r.to_dict() for c, r in self.regressions.items()},
-                "name": self.name}
+                "name": self.name, "steps": copy.deepcopy(self.steps)}
 
     @classmethod
     def from_dict(cls, d: dict) -> "AbsorptionFactorMethod":
         return cls([(c, float(w)) for c, w in d["order"]], dict(d.get("quant", {})),
                    copy.deepcopy(d.get("factors", {})),
                    {c: Regression.from_dict(r) for c, r in d.get("regressions", {}).items()},
-                   d.get("name", ""))
+                   d.get("name", ""), copy.deepcopy(d.get("steps", [])))
 
 
 PROGRESSIVE_TYPES = {"amplitude_centering": AmplitudeCentering,

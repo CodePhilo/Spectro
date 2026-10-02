@@ -919,12 +919,34 @@ def progressive(inp: OptimizerInput, sc: _Screen, resolve,
         ev = ps.evaluate(m, div)
         if ev is not None:
             scored.append((max(e["robust"] for e in ev.values()), family, m, z, ev))
-    # best configurations of each kind (family, divisor, structure)
+    # smoothed variants of the most promising configurations of each kind
+    if inp.smoothing and scored:
+        step = float(np.median(np.diff(sc.grid)))
+        top: dict[tuple, list] = {}
+        for item in sorted(scored, key=lambda t: t[0]):
+            k = (item[1], item[3], bool(getattr(item[2], "plateau", None)))
+            if len(top.setdefault(k, [])) < 4:
+                top[k].append(item)
+        for items in top.values():
+            for _, family, m, z, _ in items:
+                for width in inp.smoothing:
+                    win = sg_window(width, step)
+                    if win >= sc.grid.size // 2:
+                        continue
+                    sm = progressive_from_dict(m.to_dict())
+                    sm.regressions = {}
+                    sm.steps = [{"op": "smooth_sg", "params": {
+                        "window": win, "polyorder": min(int(inp.smoothing_order), win - 2)}}]
+                    ev = ps.evaluate(sm, sc.resolve(DIV + z) if z else None)
+                    if ev is not None:
+                        scored.append((max(e["robust"] for e in ev.values()), family, sm, z, ev))
+    # best configurations of each kind (family, divisor, structure, smoothing)
     best: dict[tuple, list] = {}
     for item in sorted(scored, key=lambda t: t[0]):
         _, family, m, z, _ = item
         key = (family, z, bool(getattr(m, "plateau", None)),
-               tuple(sorted(getattr(m, "differences", {}))))
+               tuple(sorted(getattr(m, "differences", {}))),
+               str(getattr(m, "steps", [])))
         if len(best.setdefault(key, [])) < inp.keep_per_family:
             best[key].append(item)
     sims = simulated_mixtures(inp)

@@ -277,3 +277,115 @@ def test_optimizer_saves_a_progressive_candidate(app, tmp_path, messages):
         assert saved["divisor"] in div_ids
     finally:
         win.close_project()
+
+
+def test_saved_methods_can_be_edited_and_renamed(app, tmp_path, messages, monkeypatch):
+    """Edit… reopens each method type in its dialog with all settings; saving
+    stores a new version and archives the old one."""
+    from PySide6.QtWidgets import QInputDialog, QTableWidgetItem
+
+    import spectro.ui.main_window as mw
+    from spectro.ui.dialogs_methods import (ChemometricsDialog, EquationsDialog,
+                                            ProgressiveDialog, SavedDialog, UnivariateDialog)
+    from tests.test_literature import TER, ter
+    monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: (k.get("text") or "m", True))
+    win = mw.MainWindow()
+    p = Project.create(tmp_path / "e.spectro")
+    for c in TER:
+        p.add_compound(c)
+    tid = p.add_trial("T")
+    for c in TER:
+        for v in (4, 8, 12, 16, 20, 24):
+            p.add_spectrum(ter({c: v}, f"{c} {v}"), tid, role="standard")
+    div = p.add_spectrum(ter({"Z": 24}, "Z′"), tid, role="divisor")
+    for i, (a, b, z) in enumerate([(10, 10, 10), (20, 10, 10), (6, 6, 18), (12, 4, 4),
+                                   (8, 14, 6), (16, 12, 8), (4, 18, 12), (14, 6, 16)]):
+        p.add_spectrum(ter({"X": a, "Y": b, "Z": z}, f"mix {i}"), tid,
+                       role="calibration" if i < 6 else "mixture")
+    win._attach(p)
+    try:
+        # univariate: save, edit λ, save again
+        d = UnivariateDialog(win)
+        d.compound.setCurrentText("Z")
+        d.template.setCurrentText("Direct (zero order, λmax)")
+        d.meas.set({"kind": "amplitude", "params": {"w1": 355.0}})
+        d._calibrate()
+        d._save_method()
+        m1 = p.methods()[-1]
+        e = UnivariateDialog(win)
+        e.load_method(m1)
+        assert e.name.text() == m1["name"] and e.meas.get()["params"]["w1"] == 355.0
+        assert sorted(e.cal.checked_ids()) == sorted(m1["definition"]["calibration_ids"])
+        e.meas.set({"kind": "amplitude", "params": {"w1": 360.0}})
+        e._calibrate()
+        e._save_method()
+        live = p.methods()
+        assert m1["id"] not in [m["id"] for m in live]
+        new = live[-1]["definition"]
+        assert new["measurement"]["params"]["w1"] == 360.0 and new["revision_of"] == m1["id"]
+        assert p.method(m1["id"])["archived"]
+
+        # equations
+        q = EquationsDialog(win)
+        q.load_method({"id": 0, "name": "x", "definition": {
+            "type": "equations", "compounds": ["X", "Y", "Z"], "steps": [], "intercept": False,
+            "signals": [{"kind": "amplitude", "params": {"w1": 240.0}},
+                        {"kind": "area", "params": {"w1": 285.0, "w2": 295.0}},
+                        {"kind": "amplitude", "params": {"w1": 360.0}}]}})
+        assert [s_["kind"] for s_ in q._signals()] == ["amplitude", "area", "amplitude"]
+
+        # progressive (with smoothing): save, edit, re-save
+        g = ProgressiveDialog(win)
+        g.ac_div.setCurrentIndex(g.ac_div.findData(div))
+        g.ac_divc.setCurrentText("Z")
+        g.ac_w.setValue(275.0)
+        g.ac_plateau.setChecked(True)
+        g.ac_p1.setValue(340.0)
+        g.ac_p2.setValue(380.0)
+        for j, v in enumerate(["X", "275", "240", "Y"]):
+            g.ac_diff.setItem(0, j, QTableWidgetItem(v))
+        g.ac_sub.setCurrentText("Y")
+        g.sm_win.setValue(15)
+        g._run_ac()
+        g._save_method()
+        pm = p.methods()[-1]
+        assert pm["definition"]["steps"][0]["params"]["window"] == 15
+        h = ProgressiveDialog(win)
+        h.load_method(pm)
+        assert h.sm_win.value() == 15 and h.ac_w.value() == 275.0
+        assert h.ac_diff.item(0, 3).text() == "Y" and h.ac_plateau.isChecked()
+        h.sm_win.setValue(21)
+        h._run_ac()
+        h._save_method()
+        assert p.methods()[-1]["definition"]["steps"][0]["params"]["window"] == 21
+        assert p.methods()[-1]["definition"]["version"] == 2
+
+        # chemometrics
+        c = ChemometricsDialog(win)
+        c.mtype.setCurrentText("CLS")
+        c._fit()
+        c._save_method()
+        cm = p.methods()[-1]
+        c2 = ChemometricsDialog(win)
+        c2.load_method(cm)
+        assert c2.mtype.currentText() == "CLS"
+        assert sorted(c2.cal.checked_ids()) == sorted(cm["definition"]["calibration_ids"])
+
+        # Saved methods: rename and the Edit… entry point
+        sd = SavedDialog(win)
+        sd.mtable.selectRow(0)
+        before = sd.methods[0]
+        monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: ("renamed", True))
+        sd._rename()
+        assert any(m["name"] == "renamed" for m in p.methods())
+        assert before["id"] not in [m["id"] for m in p.methods()]
+        monkeypatch.setattr(UnivariateDialog, "exec", lambda self: 0)
+        monkeypatch.setattr(ChemometricsDialog, "exec", lambda self: 0)
+        monkeypatch.setattr(ProgressiveDialog, "exec", lambda self: 0)
+        for row in range(len(sd.methods)):
+            sd.mtable.selectRow(row)
+            sd._edit()
+            assert "editing method" in sd.editor.windowTitle()
+        assert not messages, messages
+    finally:
+        win.close_project()

@@ -195,3 +195,21 @@ def test_smoothing_also_applies_to_multicomponent_models():
     assert any(lab.startswith("Vierordt") and "SG smoothing 6 nm" in lab for lab in labels)
     smoothed = next(x for x in res["ranked"]["X"] if "SG smoothing" in x.label)
     assert smoothed.model["steps"][0]["op"] == "smooth_sg"
+
+
+def test_smoothing_reaches_progressive_methods():
+    from tests.test_literature import af
+    comps = ["MET", "MEB", "DLX"]
+    std = {c: [af({c: v}, f"{c}{v}", noise=0.002, seed=int(v) * 7 + i)
+               for i, v in enumerate((4, 8, 12, 16, 20, 24))] for c in comps}
+    mixes = [af(m, f"m{i}", noise=0.002, seed=100 + i) for i, m in enumerate(
+        [{"MET": 10, "MEB": 10, "DLX": 10}, {"MET": 20, "MEB": 4, "DLX": 2},
+         {"MET": 3, "MEB": 20, "DLX": 15}])]
+    res = optimize(OptimizerInput(comps, std, {c: std[c][3] for c in comps}, mixes,
+                                  families={"absorption_factor"}, smoothing=(6.0, 10.0)))
+    cands = [x for x in res["ranked"]["DLX"] if x.family == "absorption_factor"]
+    sm = [x for x in cands if x.model.get("steps")]
+    plain = [x for x in cands if not x.model.get("steps")]
+    assert sm and plain
+    assert sm[0].model["steps"][0]["op"] == "smooth_sg" and "SG smoothing" in sm[0].label
+    assert min(x.real_rmsep for x in sm) < min(x.real_rmsep for x in plain)

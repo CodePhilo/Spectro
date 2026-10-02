@@ -642,6 +642,42 @@ class Project:
                  "definition": json.loads(r[4]), "created_utc": r[5]}
                 for r in self.conn.execute(q + " ORDER BY id", args)]
 
+    def method(self, mid: int, include_archived: bool = True) -> dict:
+        r = self.conn.execute("SELECT id, trial_id, name, type, definition, created_utc, archived"
+                              " FROM methods WHERE id=?", (mid,)).fetchone()
+        if r is None or (r[6] and not include_archived):
+            raise KeyError(f"method #{mid} not found")
+        return {"id": r[0], "trial_id": r[1], "name": r[2], "type": r[3],
+                "definition": json.loads(r[4]), "created_utc": r[5], "archived": bool(r[6])}
+
+    def revise_method(self, mid: int, name: str, definition: dict, reason: str) -> int:
+        """Edit a saved method. Saved records are never overwritten: the edit is
+        stored as a new version (``revision_of`` = the old id, ``version`` + 1)
+        and the old version is archived, both in one audited transaction with
+        the before/after definitions and the reason."""
+        if not reason.strip():
+            raise ValueError("a reason for the change is required")
+        old = self.method(mid, include_archived=False)
+        definition = dict(definition)
+        definition["revision_of"] = mid
+        definition["version"] = int(old["definition"].get("version", 1)) + 1
+        with self._tx():
+            new = self.conn.execute(
+                "INSERT INTO methods (trial_id, name, type, definition, created_utc) "
+                "VALUES (?,?,?,?,?)",
+                (old["trial_id"], name, definition.get("type", ""), _json(definition),
+                 utc_now())).lastrowid
+            self.conn.execute("UPDATE methods SET archived=1 WHERE id=?", (mid,))
+            self._audit("REVISE", "method", new,
+                        f"Revised method #{mid} '{old['name']}' → #{new} '{name}' "
+                        f"(version {definition['version']})",
+                        {"before": {"id": mid, "name": old["name"],
+                                    "definition": old["definition"]},
+                         "after": {"id": new, "name": name, "definition": definition}},
+                        reason)
+        self._notify("method", new)
+        return int(new)
+
     def archive_method(self, mid: int, reason: str) -> None:
         with self._tx():
             self.conn.execute("UPDATE methods SET archived=1 WHERE id=?", (mid,))

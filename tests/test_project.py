@@ -149,3 +149,59 @@ def test_progressive_methods_save_apply_and_travel_as_model_files(tmp_path, kind
     assert np.allclose(qm.predict_spectra(q.spectra(qmix), q.resolver()), true, rtol=1e-3)
     p.close()
     q.close()
+
+
+def test_revising_a_method_creates_an_audited_new_version(project):
+    mid = project.save_method("RD for X", {"type": "univariate", "compound": "X",
+                                           "steps": [], "measurement": {"kind": "amplitude",
+                                                                        "params": {"w1": 250}}})
+    with pytest.raises(ValueError, match="reason"):
+        project.revise_method(mid, "RD for X", {"type": "univariate"}, "  ")
+    d2 = dict(project.method(mid)["definition"])
+    d2["measurement"] = {"kind": "amplitude", "params": {"w1": 252}}
+    v2 = project.revise_method(mid, "RD for X (252 nm)", d2, "better λ")
+    v3 = project.revise_method(v2, "RD for X (252 nm)", project.method(v2)["definition"],
+                               "renamed nothing, re-saved")
+    live = project.methods()
+    assert [m["id"] for m in live] == [v3]
+    assert project.method(mid)["archived"] and project.method(v2)["archived"]
+    assert project.method(v3)["definition"]["version"] == 3
+    assert project.method(v3)["definition"]["revision_of"] == v2
+    assert project.method(v2)["definition"]["measurement"]["params"]["w1"] == 252
+    assert project.method(mid)["definition"]["measurement"]["params"]["w1"] == 250  # kept
+    rev = [e for e in project.audit_entries() if e.action == "REVISE"]
+    assert len(rev) == 2 and {e.reason for e in rev} == {"better λ", "renamed nothing, re-saved"}
+    assert project.verify()["ok"]
+    with pytest.raises(KeyError):
+        project.revise_method(mid, "x", d2, "an archived version cannot be revised")
+
+
+def test_progressive_methods_with_smoothing_steps(tmp_path):
+    """Smoothing is applied to standards, divisor and samples alike and is saved
+    with the method."""
+    from spectro.core import univariate as uv
+    from tests.test_literature import TER, ter
+    comps = list(TER)
+    std = [ter({c: v}, f"{c} {v}", noise=0.002, seed=int(v) + 7 * k)
+           for k, c in enumerate(comps) for v in (4, 8, 12, 16, 20, 24)]
+    div = ter({"Z": 24}, "Z′", noise=0.0007, seed=99)
+    mixes = [ter({"X": 10, "Y": 10, "Z": 10}, "m1", noise=0.002, seed=5),
+             ter({"X": 20, "Y": 10, "Z": 10}, "m2", noise=0.002, seed=6)]
+    sg = [{"op": "smooth_sg", "params": {"window": 31, "polyorder": 2}}]
+    out = {}
+    for steps in ([], sg):
+        m = uv.AmplitudeCentering(275.0, comps, subtract="Y", divisor_compound="Z",
+                                  plateau=(340.0, 380.0),
+                                  differences={"X": {"w1": 275.0, "w2": 240.0,
+                                                     "factor_from": "Y"}},
+                                  divisor=div, steps=steps)
+        m.fit_spectra(std)
+        out[bool(steps)] = m.predict_spectra(mixes)
+        if steps:
+            rt = uv.progressive_from_dict({**m.to_dict(), "divisor": None})
+            assert rt.steps == sg and "SG smoothing (31 pts" in rt.describe()
+    true = np.array([[10, 10, 10], [20, 10, 10]])
+    err = {k: np.abs(v / true - 1).max() for k, v in out.items()}
+    assert err[True] < 0.5 * err[False] and err[True] < 0.05   # 10.3 % → 3.4 % here
+    af = uv.AbsorptionFactorMethod([("X", 340.0)], steps=sg)
+    assert uv.progressive_from_dict(af.to_dict()).steps == sg

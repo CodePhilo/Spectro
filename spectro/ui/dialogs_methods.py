@@ -99,6 +99,42 @@ def add_grouped(combo: QComboBox, groups: dict[str, list[str]]) -> None:
             combo.addItem(n)
 
 
+def check_ids(lst: SpectrumChecklist, ids) -> None:
+    """Check exactly the spectra in ``ids`` (unknown ids are ignored)."""
+    ids = {int(i) for i in ids or []}
+    for i in range(lst.count()):
+        it = lst.item(i)
+        it.setCheckState(Qt.Checked if it.data(Qt.UserRole) in ids else Qt.Unchecked)
+
+
+def store_method(dlg, name: str, definition: dict) -> int | None:
+    """Save a new method, or — when the dialog was opened with *Edit…* from
+    Saved methods — a new version of the edited one (old version archived,
+    reason required)."""
+    from spectro.ui.widgets import ask_reason
+    ed = getattr(dlg, "editing", None)
+    if ed:
+        reason = ask_reason(dlg, f"Save the changes to method #{ed['id']} '{ed['name']}' as a "
+                                 "new version? The current version is kept in the archive.",
+                            required=True)
+        if not reason:
+            return None
+        mid = dlg.project.revise_method(ed["id"], name, definition, reason)
+        dlg.editing = dlg.project.method(mid)
+        dlg.setWindowTitle(dlg.windowTitle().split(" — editing")[0]
+                           + f" — editing method #{mid} '{name}'")
+    else:
+        mid = dlg.project.save_method(name, definition, dlg.win.current_trial())
+    dlg.method_id = mid
+    dlg.win.statusBar().showMessage(f"Method #{mid} saved.")
+    return mid
+
+
+def start_editing(dlg, md: dict) -> None:
+    dlg.editing = md
+    dlg.setWindowTitle(dlg.windowTitle() + f" — editing method #{md['id']} '{md['name']}'")
+
+
 def list_box(title: str, lst: SpectrumChecklist) -> QGroupBox:
     g = QGroupBox(title)
     v = QVBoxLayout(g)
@@ -364,8 +400,21 @@ class UnivariateDialog(Base):
             return
         d = self.method.to_dict()
         d["calibration_ids"] = self.cal_ids
-        self.method_id = self.project.save_method(self.method.name, d, self.win.current_trial())
-        self.win.statusBar().showMessage("Method saved.")
+        store_method(self, self.method.name, d)
+
+    def load_method(self, md: dict) -> None:
+        """Fill the dialog from a saved method so it can be changed and re-saved."""
+        d = md["definition"]
+        self.compound.setCurrentText(d["compound"])
+        self.name.setText(md["name"])
+        self.origin.setChecked(bool(d.get("through_origin")))
+        self.direct.setChecked(bool(d.get("direct")))
+        self.pipe.set_steps(d.get("steps", []))
+        self.meas.set(d["measurement"])
+        if d.get("calibration_ids"):
+            check_ids(self.cal, d["calibration_ids"])
+        start_editing(self, md)
+        self._preview()
 
     def _save_results(self):
         if not getattr(self, "last", None):
@@ -708,11 +757,28 @@ class EquationsDialog(Base):
         if self.model is None:
             error(self, "Fit first.")
             return
-        name, ok = QInputDialog.getText(self, "Save method", "Name:", text="Equation method")
+        ed = getattr(self, "editing", None)
+        name, ok = QInputDialog.getText(self, "Save method", "Name:",
+                                        text=ed["name"] if ed else "Equation method")
         if ok:
             d = self.model.to_dict()
             d["calibration_ids"] = self.cal_ids
-            self.method_id = self.project.save_method(name, d, self.win.current_trial())
+            store_method(self, name.strip() or "Equation method", d)
+
+    def load_method(self, md: dict) -> None:
+        d = md["definition"]
+        for i in range(self.comps.count()):
+            it = self.comps.item(i)
+            it.setCheckState(Qt.Checked if it.text() in d["compounds"] else Qt.Unchecked)
+        rows = [[s["kind"], f"{s['params']['w1']:g}",
+                 f"{s['params']['w2']:g}" if s["kind"] == "area" else ""] for s in d["signals"]]
+        fill_table(self.signals, ["Kind (amplitude/area)", "λ1 (nm)", "λ2 (nm, area only)"],
+                   rows, editable=True)
+        self.pipe.set_steps(d.get("steps", []))
+        self.intercept.setChecked(bool(d.get("intercept")))
+        if d.get("calibration_ids"):
+            check_ids(self.cal, d["calibration_ids"])
+        start_editing(self, md)
 
     def _save_results(self):
         if not self.predictions:
@@ -1075,6 +1141,22 @@ class ProgressiveDialog(Base):
         tabs.addTab(self._ac_tab(), "Ratio: amplitude centering (AAC, MACM, RIDSS, CV-AD)")
         tabs.addTab(self._af_tab(), "Zero order: successive absorption factor (MAFM)")
         lay = QVBoxLayout(self)
+        pre = QHBoxLayout()
+        self.sm_win = QSpinBox()
+        self.sm_win.setRange(0, 501)
+        self.sm_win.setSingleStep(2)
+        self.sm_win.setSpecialValueText("off")
+        self.sm_win.setSuffix(" points")
+        self.sm_win.setToolTip("Savitzky–Golay smoothing applied to the standards, the divisor "
+                               "and the samples before the method (odd window; 0 = off).")
+        self.sm_ord = QSpinBox()
+        self.sm_ord.setRange(1, 6)
+        self.sm_ord.setValue(2)
+        for w in (QLabel("Pre-processing — Savitzky–Golay smoothing window:"), self.sm_win,
+                  QLabel("order"), self.sm_ord):
+            pre.addWidget(w)
+        pre.addStretch(1)
+        lay.addLayout(pre)
         lay.addWidget(tabs, 3)
         self.results = PasteTable()
         self.summary = QLabel()
@@ -1095,6 +1177,22 @@ class ProgressiveDialog(Base):
             b.clicked.connect(fn)
             row.addWidget(b)
         lay.addLayout(row)
+
+    def _steps(self) -> list[dict]:
+        w = self.sm_win.value()
+        if not w:
+            return []
+        if w % 2 == 0:
+            w += 1
+        if self.sm_ord.value() >= w:
+            raise ValueError("the smoothing window must be larger than the polynomial order")
+        return [{"op": "smooth_sg", "params": {"window": w, "polyorder": self.sm_ord.value()}}]
+
+    def _set_steps(self, steps: list[dict]) -> None:
+        sg = next((st for st in steps if st["op"] == "smooth_sg"), None)
+        self.sm_win.setValue(int(sg["params"]["window"]) if sg else 0)
+        if sg:
+            self.sm_ord.setValue(int(sg["params"]["polyorder"]))
 
     def _lists(self):
         recs = self.project.records()
@@ -1180,11 +1278,12 @@ class ProgressiveDialog(Base):
             if self.ac_div.currentData() is None:
                 raise ValueError("choose the divisor spectrum")
             m.divisor = self.ac_div.currentData()
-            div = self.project.spectrum(m.divisor)
+            m.steps = self._steps()
+            res = self.project.resolver()
             cal = self.ac_std.checked_ids()
-            info = m.fit_spectra(self.project.spectra(cal), self.project.resolver())
+            info = m.fit_spectra(self.project.spectra(cal), res)
             mixes = self.project.spectra(self.ac_mix.checked_ids())
-            out = [(s, m.predict(s, div)) for s in mixes]
+            out = [(s, m.predict_one(s, res)) for s in mixes]
         except Exception as exc:
             error(self, exc)
             return
@@ -1238,11 +1337,13 @@ class ProgressiveDialog(Base):
                 q = _num_cell(self.af_table, i, 2)
                 if q is not None:
                     quant[c] = q
-            m = uv.AbsorptionFactorMethod(order, quant)
+            m = uv.AbsorptionFactorMethod(order, quant, steps=self._steps())
             comps = [c for c, _ in order]
             cal = self.af_std.checked_ids()
-            info = m.fit_spectra(self.project.spectra(cal))
-            out = [(s, m.predict(s)) for s in self.project.spectra(self.af_mix.checked_ids())]
+            res = self.project.resolver()
+            info = m.fit_spectra(self.project.spectra(cal), res)
+            out = [(s, m.predict_one(s, res))
+                   for s in self.project.spectra(self.af_mix.checked_ids())]
         except Exception as exc:
             error(self, exc)
             return
@@ -1292,15 +1393,54 @@ class ProgressiveDialog(Base):
         m, cal = self.fitted
         kind = ("Amplitude centering" if isinstance(m, uv.AmplitudeCentering)
                 else "Absorption factor")
+        ed = getattr(self, "editing", None)
         name, ok = QInputDialog.getText(self, "Save method", "Method name:",
-                                        text=f"{kind}: {m.describe()}")
+                                        text=ed["name"] if ed else f"{kind}: {m.describe()}")
         if not ok:
             return
         m.name = name.strip() or kind
         d = m.to_dict()
         d["calibration_ids"] = list(cal)
-        self.method_id = self.project.save_method(m.name, d, self.win.current_trial())
-        self.win.statusBar().showMessage(f"Method #{self.method_id} saved.")
+        store_method(self, m.name, d)
+
+    def load_method(self, md: dict) -> None:
+        d = md["definition"]
+        self._set_steps(d.get("steps", []))
+        cal = d.get("calibration_ids") or []
+        if d["type"] == "amplitude_centering":
+            self.tabs.setCurrentIndex(0)
+            for i in range(self.ac_comps.count()):
+                it = self.ac_comps.item(i)
+                it.setCheckState(Qt.Checked if it.text() in d["compounds"] else Qt.Unchecked)
+            if d.get("divisor") is not None:
+                k = self.ac_div.findData(int(d["divisor"]))
+                if k >= 0:
+                    self.ac_div.setCurrentIndex(k)
+            self.ac_divc.setCurrentText(d.get("divisor_compound") or "(none)")
+            self.ac_w.setValue(float(d["wavelength"]))
+            self.ac_plateau.setChecked(bool(d.get("plateau")))
+            if d.get("plateau"):
+                self.ac_p1.setValue(float(d["plateau"][0]))
+                self.ac_p2.setValue(float(d["plateau"][1]))
+            self.ac_diff.clearContents()
+            for i, (c, df) in enumerate(d.get("differences", {}).items()):
+                for j, v in enumerate((c, f"{df['w1']:g}", f"{df['w2']:g}",
+                                       df.get("factor_from") or "")):
+                    self.ac_diff.setItem(i, j, QTableWidgetItem(v))
+            self.ac_sub.setCurrentText(d.get("subtract") or "(none)")
+            self.ac_unified.setChecked(bool(d.get("unified")))
+            if cal:
+                check_ids(self.ac_std, cal)
+        else:
+            self.tabs.setCurrentIndex(1)
+            self.af_table.clearContents()
+            for i, (c, w) in enumerate(d["order"]):
+                q = d.get("quant", {}).get(c)
+                for j, v in enumerate((c, f"{w:g}", "" if q is None else f"{q:g}")):
+                    self.af_table.setItem(i, j, QTableWidgetItem(v))
+            if cal:
+                check_ids(self.af_std, cal)
+        start_editing(self, md)
 
 
 # --------------------------------------------------------------------------- #
@@ -1682,13 +1822,42 @@ class ChemometricsDialog(Base):
         if self.model is None:
             error(self, "Fit first.")
             return
+        ed = getattr(self, "editing", None)
         name, ok = QInputDialog.getText(self, "Save method", "Name:",
-                                        text=f"{self.model.model_type} model")
+                                        text=ed["name"] if ed else
+                                        f"{self.model.model_type} model")
         if ok:
             d = self.model.to_dict(include_fit=True)
             d["calibration_ids"] = self.cal_ids
-            self.method_id = self.project.save_method(name, d, self.win.current_trial())
-            self.win.statusBar().showMessage("Fitted model saved (applies without refitting).")
+            if store_method(self, name.strip() or "Model", d) is not None:
+                self.win.statusBar().showMessage("Fitted model saved (applies without "
+                                                 "refitting).")
+
+    def load_method(self, md: dict) -> None:
+        d = md["definition"]
+        self.mtype.setCurrentText(d["model_type"])
+        for i in range(self.comps.count()):
+            it = self.comps.item(i)
+            it.setCheckState(Qt.Checked if it.text() in d["compounds"] else Qt.Unchecked)
+        self.pipe.set_steps(d.get("steps", []))
+        self.ranges.setText("; ".join(f"{a:g}-{b:g}" for a, b in d.get("ranges", [])))
+        self.wls.setText(", ".join(f"{w:g}" for w in d.get("wavelengths", [])))
+        self.ncomp.setValue(int(d.get("n_components", 2)))
+        self.prep.setCurrentText(d.get("preprocessing", "mean_center"))
+        o = d.get("options", {})
+        if "hidden" in o:
+            self.hidden.setText(str(o["hidden"]))
+        if "activation" in o:
+            self.act.setCurrentText(o["activation"])
+        if "kernel" in o:
+            self.kernel.setCurrentText(o["kernel"])
+        if "C" in o:
+            self.svr_c.setValue(float(o["C"]))
+        if "epsilon" in o:
+            self.svr_eps.setValue(float(o["epsilon"]))
+        if d.get("calibration_ids"):
+            check_ids(self.cal, d["calibration_ids"])
+        start_editing(self, md)
 
     def _save_results(self):
         if not self.predictions:
@@ -1730,6 +1899,13 @@ class SavedDialog(Base):
         row = QHBoxLayout()
         apply_btn = QPushButton("Apply to selected spectra in the project tree")
         apply_btn.clicked.connect(self._apply)
+        edit = QPushButton("Edit…")
+        edit.setToolTip("Open the method in its dialog with all its settings; change anything, "
+                        "recalibrate and Save method. The change is stored as a new version "
+                        "(the old one is archived, the reason is recorded).")
+        edit.clicked.connect(self._edit)
+        ren = QPushButton("Rename…")
+        ren.clicked.connect(self._rename)
         arch = QPushButton("Archive method…")
         arch.clicked.connect(self._archive)
         exp = QPushButton("Export model file…")
@@ -1738,7 +1914,7 @@ class SavedDialog(Base):
         exp.clicked.connect(self._export_model)
         imp = QPushButton("Import model file…")
         imp.clicked.connect(self._import_model)
-        for b in (apply_btn, exp, imp, arch):
+        for b in (apply_btn, edit, ren, exp, imp, arch):
             row.addWidget(b)
         row.addStretch(1)
         ml.addLayout(row)
@@ -1765,8 +1941,12 @@ class SavedDialog(Base):
 
     def _load(self):
         self.methods = self.project.methods()
-        fill_table(self.mtable, ["#", "Name", "Type", "Created (UTC)"],
-                   [[str(m["id"]), m["name"], m["type"], m["created_utc"][:19]] for m in self.methods])
+        fill_table(self.mtable, ["#", "Name", "Type", "Version", "Created (UTC)"],
+                   [[str(m["id"]), m["name"], m["type"],
+                     str(m["definition"].get("version", 1))
+                     + (f" (replaces #{m['definition']['revision_of']})"
+                        if m["definition"].get("revision_of") else ""),
+                     m["created_utc"][:19]] for m in self.methods])
         self.res = self.project.results()
         fill_table(self.rtable, ["#", "Name", "Kind", "Method", "Created (UTC)"],
                    [[str(r["id"]), r["name"], r["kind"], str(r["method_id"] or ""),
@@ -1797,6 +1977,49 @@ class SavedDialog(Base):
         self.out.export_notes = summary
         self.detail.setPlainText("\n".join([f"{res['name']}  ({res['kind']}, result #{res['id']})"]
                                            + summary))
+
+    EDITORS = {"univariate": "UnivariateDialog", "equations": "EquationsDialog",
+               "spectral": "ChemometricsDialog", "amplitude_centering": "ProgressiveDialog",
+               "absorption_factor": "ProgressiveDialog"}
+
+    def _selected_method(self) -> dict | None:
+        r = self.mtable.currentRow()
+        if not 0 <= r < len(self.methods):
+            error(self, "Select a method.")
+            return None
+        return self.methods[r]
+
+    def _edit(self):
+        md = self._selected_method()
+        if md is None:
+            return
+        cls = self.EDITORS.get(md["type"])
+        if cls is None:
+            error(self, f"Methods of type '{md['type']}' cannot be edited.")
+            return
+        dlg = globals()[cls](self.win)
+        try:
+            dlg.load_method(md)
+        except Exception as exc:
+            error(self, f"Could not load the method: {exc}")
+            return
+        self.editor = dlg
+        dlg.exec()
+        self._load()
+
+    def _rename(self):
+        from spectro.ui.widgets import ask_reason
+        md = self._selected_method()
+        if md is None:
+            return
+        name, ok = QInputDialog.getText(self, "Rename method", "New name:", text=md["name"])
+        if not ok or not name.strip() or name.strip() == md["name"]:
+            return
+        reason = ask_reason(self, f"Rename method #{md['id']} to '{name.strip()}'?",
+                            required=True)
+        if reason:
+            self.project.revise_method(md["id"], name.strip(), md["definition"], reason)
+            self._load()
 
     def _archive(self):
         from spectro.ui.widgets import ask_reason
